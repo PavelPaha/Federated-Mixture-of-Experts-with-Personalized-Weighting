@@ -5,6 +5,9 @@ description = "Add your description here"
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
+    "dm-tree>=0.1.9",
+    "ninja>=1.11.1.4",
+    "numpy>=2.2.5",
     "torch>=2.7.0",
     "torchvision>=0.22.0",
 ]
