@@ -5,230 +5,180 @@ import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import DataLoader
 from datasets import load_dataset
-from transformers import GPT2TokenizerFast
 from torch.utils.data.dataset import IterableDataset
 from tqdm import tqdm
+from config import TrainConfig
+from copy import deepcopy
 
 from fmoe.transformer import FMoETransformerMLP
-from fmoe.gates import GShardGate
+from fmoe.gates import NaiveGate
 
-tokenizer = GPT2TokenizerFast.from_pretrained("gpt2")
-if tokenizer.pad_token is None:
-    tokenizer.add_special_tokens({"pad_token": "[PAD]"})
+from model import TransformerWithMoE
+from data import WikiText103LMIterable, create_wikitext_dataloader, tokenizer
 
-class WikiText103LMIterable(IterableDataset):
-    def __init__(self, split="train", seq_len=40):
-        super().__init__()
-        self.seq_len = seq_len
-        self.raw_ds = load_dataset(
-            "wikitext", "wikitext-103-raw-v1", split=split, streaming=True
-        )
+import os
+import datetime
+import torch
+import torch.nn as nn
+from tqdm import tqdm
+from config import TrainConfig, Metrics
 
-    def __iter__(self):
-        buffer = []
-        for example in self.raw_ds:
-            text = example["text"]
-            if not text or text.isspace():
-                continue
-            ids = tokenizer.encode(text, add_special_tokens=False)
-            buffer.extend(ids)
-            while len(buffer) >= self.seq_len + 1:
-                chunk = buffer[: self.seq_len + 1]
-                buffer = buffer[self.seq_len + 1 :]
-                inp = torch.tensor(chunk[:-1], dtype=torch.long)
-                tgt = torch.tensor(chunk[1:], dtype=torch.long)
-                yield inp, tgt
+vocab_size = tokenizer.vocab_size + 1
 
+gate_scores = None
+def get_scores(module, inp, out, idx=0):
+    global gate_scores
+    gate_scores = module.raw_forward(inp[0], return_all_scores=True)
+    print(gate_scores[-1].shape)
 
-def create_wikitext_dataloader(batch_size=6, seq_len=40, split="train", num_workers=4):
-    ds = WikiText103LMIterable(split=split, seq_len=seq_len)
-    return DataLoader(
-        ds,
-        batch_size=batch_size,
-        num_workers=num_workers,
-        drop_last=True,
-        prefetch_factor=2,
-    )
-
-class TransformerLayer(nn.Module):
-    def __init__(self, d_model, num_experts, top_k):
-        super().__init__()
-        self.self_attn = nn.MultiheadAttention(d_model, num_heads=8, batch_first=True)
-        self.norm1 = nn.LayerNorm(d_model)
-        self.moe = FMoETransformerMLP(
-            num_expert=num_experts,
-            d_model=d_model,
-            d_hidden=d_model * 4,
-            top_k=top_k,
-            activation=nn.GELU(),
-            expert_dp_comm="none",
-            expert_rank=0,
-            gate=GShardGate
-        )
-        self.norm2 = nn.LayerNorm(d_model)
-
-    def forward(self, x):
-        res = x
-        x = self.norm1(x)
-        attn_out, _ = self.self_attn(x, x, x)
-        x = res + attn_out
-
-        res = x
-        x = self.norm2(x)
-        bsz, seq_len, d_model = x.shape
-        x_flat = x.view(-1, d_model)
-        moe_out = self.moe(x_flat)
-        moe_out = moe_out.view(bsz, seq_len, d_model)
-        return res + moe_out
-
-class TransformerWithMoE(nn.Module):
-    def __init__(self, vocab_size, d_model=256, num_layers=3, num_experts=10, top_k=2):
-        super().__init__()
-        self.token_emb = nn.Embedding(vocab_size, d_model,
-                                      padding_idx=tokenizer.pad_token_id)
-        self.pos_emb = nn.Parameter(torch.randn(1024, d_model) * 0.02)
-        self.layers = nn.ModuleList([
-            TransformerLayer(d_model, num_experts, top_k)
-            for _ in range(num_layers)
-        ])
-        self.norm = nn.LayerNorm(d_model)
-        self.head = nn.Linear(d_model, vocab_size)
-
-    def forward(self, x):
-        bsz, seq_len = x.size()
-        x = self.token_emb(x) + self.pos_emb[:seq_len]
-        for layer in self.layers:
-            x = layer(x)
-        x = self.norm(x)
-        return self.head(x)
 
 def train(
-    model, 
-    train_loader, 
-    test_loader, 
-    optimizer, 
-    criterion, 
-    load_balance_weight,
-    log_interval=2000,
-    num_epochs=2,
+    model,
+    train_loader,
+    test_loader,
+    optimizer,
+    criterion,
+    config: TrainConfig,
     device="cuda"
 ):
+    """
+    Запускает тренировку модели с учётом параметров из config,
+    накапливает метрики в config.metrics и по завершении
+    сохраняет config вместе с метриками в человекочитаемый JSON.
+    """
     model.to(device)
     model.train()
 
-
-    metrics = {
-        'iter': [],
-        'train_main': [],
-        'train_balance': [],
-        'train_total': [],
-        'test_loss': []
-    }
+    # Сброс метрик перед стартом
+    config.metrics = Metrics()
     global_iter = 0
 
-    for epoch in range(num_epochs):
-        loop = tqdm(enumerate(train_loader), desc=f"Epoch {epoch+1}")
+    for epoch in range(1, config.epochs + 1):
+        loop = tqdm(enumerate(train_loader, 1), desc=f"Epoch {epoch}/{config.epochs}")
         for batch_idx, (inputs, targets) in loop:
             inputs, targets = inputs.to(device), targets.to(device)
 
             optimizer.zero_grad()
             outputs = model(inputs)
 
-            main_loss = criterion(
+            target_loss = criterion(
                 outputs.view(-1, outputs.size(-1)),
                 targets.view(-1)
             )
+
             balance_loss = 0.0
             cnt = 0
             for m in model.modules():
-                if isinstance(m, FMoETransformerMLP) and hasattr(m.gate, 'get_loss') and m.gate.has_loss:
+                if hasattr(m, "gate") and getattr(m.gate, "has_loss", False):
                     balance_loss += m.gate.get_loss()
-                    
                     cnt += 1
             if cnt > 0:
                 balance_loss = balance_loss / cnt
-                loss = main_loss + load_balance_weight * balance_loss
+                total_loss = target_loss + config.alpha * balance_loss
             else:
-                loss = main_loss
+                total_loss = target_loss
 
-            loss.backward()
+            gate_top_k_idx, gate_score, expert_distr = gate_scores
+            seq_len = expert_distr.shape[0] # на самом деле это batch_size * seq_len
+            raise Exception(expert_distr.shape)
+
+            B, S = config.batch_size, config.seq_len
+
+            expert_distr_by_device = expert_distr.view(B, S, config.world_size, config.num_experts_per_device) # seq_len x world_size x num_experts_per_device
+
+            fashions = expert_distr_by_device.max(dim=-1).values     # (batch, seq, world)
+            dist2   = (expert_distr_by_device**2).mean(dim=-1)        # (batch, seq, world)
+            fash2   = (fashions**2).mean(dim=-1)                     # (batch, seq)
+            loss_dist    = dist2.mean()      # scalar
+            loss_fashion = fash2.mean()      # scalar
+
+            total_loss = total_loss + config.lambda_2 * loss_dist - config.lambda_1 * loss_fashion
+
+            total_loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             optimizer.step()
 
             global_iter += 1
-            metrics['iter'].append(global_iter)
-            metrics['train_main'].append(main_loss.item())
-            metrics['train_balance'].append(balance_loss.item() if cnt>0 else 0.0)
-            metrics['train_total'].append(loss.item())
 
-            loop.set_postfix({
-                'main': f"{main_loss.item():.4f}",
-                'bal': f"{balance_loss.item():.6f}",
-                'total': f"{loss.item():.4f}"
-            })
+            config.metrics.train_losses.target_loss.append(target_loss.item())
+            config.metrics.train_losses.balance_loss.append(balance_loss.item() if cnt > 0 else 0.0)
 
-            if global_iter % log_interval == 0:
+            config.metrics.train_losses.distribution_loss.append(loss_dist.item())
+            config.metrics.train_losses.fashion_loss.append(loss_fashion.item())
+ 
+            if global_iter % config.log_interval == 0:
+                
                 model.eval()
-                test_losses = []
+                val_losses = []
                 with torch.no_grad():
-                    for i, (t_in, t_tgt) in enumerate(test_loader):
+                    for t_in, t_tgt in test_loader:
                         t_in, t_tgt = t_in.to(device), t_tgt.to(device)
                         t_out = model(t_in)
-                        t_loss = criterion(
+                        v_loss = criterion(
                             t_out.view(-1, t_out.size(-1)),
                             t_tgt.view(-1)
                         )
-                        test_losses.append(t_loss.item())
-                avg_test = sum(test_losses) / len(test_losses)
-                metrics['test_loss'].append(avg_test)
-                print(f"\n[Iter {global_iter}] Test loss: {avg_test:.4f}")
-                with open('metrics.pkl', 'wb') as f:
-                    pickle.dump(metrics, f)
+                        val_losses.append(v_loss.item())
+                avg_val = sum(val_losses) / len(val_losses)
+                config.metrics.val_losses.target_loss.append(avg_val)
+
+                out_name = f"traincfg_alpha{config.alpha:.2f}_{timestamp}.json"
+                config.to_json(out_name)
+
+                tqdm.write(f"[Iter {global_iter}] Val loss: {avg_val:.4f}")
                 model.train()
 
-        ckpt_path = f'checkpoint_epoch_{epoch+1}.pt'
+        ckpt_name = f"ckpt_alpha{config.alpha:.2f}_epoch{epoch}.pt"
         torch.save({
-            'epoch': epoch+1,
-            'model_state': model.state_dict(),
-            'optimizer_state': optimizer.state_dict(),
-            'metrics': metrics
-        }, ckpt_path)
-        print(f"🔖 Checkpoint saved: {ckpt_path}")
+            "epoch": epoch,
+            "model_state": model.state_dict(),
+            "optimizer_state": optimizer.state_dict(),
+        }, ckpt_name)
+        print(f"🔖 Saved checkpoint: {ckpt_name}")
 
-    with open('metrics.pkl', 'wb') as f:
-        pickle.dump(metrics, f)
-    print("Training complete. Metrics saved to metrics.pkl")
+    timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    out_name = f"traincfg_alpha{config.alpha:.2f}_{timestamp}.json"
+    config.to_json(out_name)
+    print(f"✅ Training finished. Config with metrics saved to {out_name}")
 
-def main():
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    num_experts_per_device, world_size = 5, 2
-    total_experts = num_experts_per_device * world_size
-    d_model, num_layers, top_k = 256, 3, 2
-    seq_len, batch_size = 256, 32
-    vocab_size = tokenizer.vocab_size + 1
 
-    print(f"Config: {total_experts} experts, vocab_size={vocab_size}")
 
-    train_loader = create_wikitext_dataloader(batch_size, seq_len, split="train")
-    test_loader  = create_wikitext_dataloader(batch_size, seq_len, split="validation")
 
-    model = TransformerWithMoE(vocab_size, d_model, num_layers, total_experts, top_k)
-    optimizer = optim.Adam(model.parameters(), lr=4e-4)
-    criterion = nn.CrossEntropyLoss(ignore_index=tokenizer.pad_token_id)
+def run_with_alphas(alphas, config: TrainConfig):
+    train_loader = create_wikitext_dataloader(config.batch_size, config.seq_len, split="train")
+    test_loader  = create_wikitext_dataloader(config.batch_size, config.seq_len, split="validation")
+    
+    for alpha in alphas:
+        print(f"\n=== Training with alpha={alpha} ===\n")
+        config = deepcopy(config)
+        config.alpha = alpha
+        model = TransformerWithMoE(
+            vocab_size,
+            config.d_model,
+            config.num_layers,
+            config.num_experts_per_device,
+            config.world_size,
+            config.top_k,
+            padding_idx=tokenizer.pad_token_id
+        )
 
-    print(f"Model parameters: {sum(p.numel() for p in model.parameters()):,}")
+        for i, layer in enumerate(model.layers):
+            layer.moe.gate.register_forward_hook(get_scores)
 
-    train(
-        model,
-        train_loader,
-        test_loader,
-        optimizer,
-        criterion,
-        load_balance_weight=0.015,
-        log_interval=5000,
-        num_epochs=5,
-        device=device
-    )
+        optimizer = optim.Adam(model.parameters(), lr=4e-4)
+        criterion = nn.CrossEntropyLoss(ignore_index=tokenizer.pad_token_id)
 
-if __name__ == "__main__":
-    main()
+        train(
+            model,
+            train_loader,
+            test_loader,
+            optimizer,
+            criterion,
+            config=config,
+            device='cuda'
+        )
+
+
+config = TrainConfig()
+alphas = [0.0, 0.2, 0.5, 0.8, 1.0]
+run_with_alphas(alphas, config)
