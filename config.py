@@ -15,7 +15,7 @@ class TrainConfig:
     epochs: int = 1
     num_experts_per_device: int = 5
     world_size: int = 2
-    d_model: int = 256
+    d_model: int = 128
     num_layers: int = 3
     top_k: int = 1
     seq_len: int = 256
