@@ -1,60 +1,49 @@
-r"""
-Naive gate
-"""
-from fmoe.gates.base_gate import BaseGate
-
+import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from fastmoe.fmoe.gates.naive_gate import NaiveGate
 
 
-class MyGate(BaseGate):
-    def __init__(self, d_model, num_expert, world_size, top_k=2, gate_bias=True):
-        super().__init__(num_expert, world_size)
-        self.gate = nn.Linear(d_model, self.tot_expert, bias = gate_bias)
-        self.top_k = top_k 
+class MyGate(NaiveGate):
+    def __init__(self, d_model, num_expert, world_size, topk=1,
+                 switch_eps=0.1, capacity=(1.2, 2.4), gate_bias=True):
+        assert topk == 1, 'topk should be 1 in switch'
+        super().__init__(d_model, num_expert, world_size, top_k=1, gate_bias=gate_bias)
+        self.switch_eps = switch_eps
+        self.capacity = capacity
 
-    def cv_squared(self, x):
-        """The squared coefficient of variation of a sample.
-        Useful as a loss to encourage a positive distribution to be more uniform.
-        Epsilons added for numerical stability.
-        Returns 0 for an empty Tensor.
-        Args:
-        x: a `Tensor`.
-        Returns:
-        a `Scalar`.
-        """
-        eps = 1e-10
-        # if only num_expert = 1
-        if x.shape[0] == 1:
-            return torch.tensor(0.0, device=x.device, requires_grad=True)
-        return x.float().var() / (x.float().mean() ** 2 + eps)
+    def forward(self, inp, return_all_scores: bool = False):
+        gate_logits = self.gate(inp)
+        self.last_gate_logits = gate_logits.detach()
+        score = gate_logits
 
-    def raw_forward(self, inp, return_all_scores=True):
-        gate_out = self.gate(inp)
-        gate_top_k_val, gate_top_k_idx = torch.topk(
-            gate_out, k=self.top_k, dim=-1, largest=True, sorted=False
-        )  # [.. x top_k]
-        gate_top_k_val = gate_top_k_val.view(-1, self.top_k)
+        if self.training:
+            noise = torch.rand_like(score)
+            noise = noise * 2 * self.switch_eps + 1.0 - self.switch_eps
+            score += noise
 
-        # (BxL) x 1 x top_k
-        gate_score = F.softmax(gate_top_k_val, dim=-1)
+        score = F.softmax(score.float(), dim=-1)
+        top1_score, top1_idx = torch.topk(score, k=1, dim=-1)  # [N, 1]
+        top1_score = top1_score.to(dtype=inp.dtype)
 
-        # Calculate load balancing loss
-        # Get full softmax for importance calculation
-        full_gates = F.softmax(gate_out, dim=-1)
-        
-        # Calculate importance (how much each expert is used)
-        importance = full_gates.sum(0)
-        
-        # Calculate load balancing loss using coefficient of variation
-        balance_loss = self.cv_squared(importance)
-        
-        self.set_loss(balance_loss)
+        valid_idx = top1_idx[top1_idx > -1]
+
+        if valid_idx.numel() > 0:
+            fraction_expert = torch.scatter_add(
+                torch.zeros(self.tot_expert, device=valid_idx.device),
+                0,
+                valid_idx,
+                torch.ones_like(valid_idx, dtype=torch.float),
+            ) / valid_idx.numel()
+
+            prob_expert = score.sum(dim=0) / valid_idx.numel()
+            loss = (fraction_expert * prob_expert).sum() * self.tot_expert
+        else:
+            loss = torch.tensor(0.0, device=inp.device, dtype=inp.dtype)
+
+        self.set_loss(loss)
 
         if return_all_scores:
-            return gate_top_k_idx, gate_score, F.softmax(gate_out, dim=-1)
-        return gate_top_k_idx, gate_score
-
-    def forward(self, inp, return_all_scores=False):
-        return self.raw_forward(inp, return_all_scores)
+            return top1_idx, top1_score, gate_logits
+        return top1_idx, top1_score

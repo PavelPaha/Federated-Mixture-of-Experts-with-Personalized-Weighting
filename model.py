@@ -4,9 +4,9 @@ import torch
 import torch.nn as nn
 
 from fmoe.transformer import FMoETransformerMLP
-# from fmoe.gates import NaiveGate
-from my_gshard import GShardGate
+# from my_gshard import GShardGate
 from my_gate import MyGate
+
 
 class TransformerLayer(nn.Module):
     def __init__(self, d_model, num_experts, world_size, top_k, gate_hook=None):

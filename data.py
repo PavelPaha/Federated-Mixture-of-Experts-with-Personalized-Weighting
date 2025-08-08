@@ -9,12 +9,10 @@ if tokenizer.pad_token is None:
     tokenizer.add_special_tokens({"pad_token": "[PAD]"})
 
 class WikiText103LMIterable(IterableDataset):
-    def __init__(self, split="train", seq_len=40):
+    def __init__(self, source, seq_len=40):
         super().__init__()
         self.seq_len = seq_len
-        self.raw_ds = load_dataset(
-            "wikitext", "wikitext-103-raw-v1", split=split, streaming=True
-        )
+        self.raw_ds = source
 
     def __iter__(self):
         buffer = []
@@ -32,8 +30,8 @@ class WikiText103LMIterable(IterableDataset):
                 yield inp, tgt
 
 
-def create_wikitext_dataloader(batch_size=6, seq_len=40, split="train", num_workers=2):
-    ds = WikiText103LMIterable(split=split, seq_len=seq_len)
+def create_wikitext_dataloader(source, batch_size=6, seq_len=40, num_workers=1):
+    ds = WikiText103LMIterable(source, seq_len=seq_len)
     return DataLoader(
         ds,
         batch_size=batch_size,

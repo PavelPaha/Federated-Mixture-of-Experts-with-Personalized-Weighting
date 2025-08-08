@@ -29,8 +29,7 @@ gate_scores = None
 def get_scores(module, inp, out, idx=0):
     global gate_scores
     gate_scores = module.raw_forward(inp[0], return_all_scores=True)
-    print(gate_scores[-1].shape)
-
+    # print(gate_scores[-1].shape)
 
 def train(
     model,
@@ -49,7 +48,6 @@ def train(
     model.to(device)
     model.train()
 
-    # Сброс метрик перед стартом
     config.metrics = Metrics()
     global_iter = 0
 
@@ -79,18 +77,15 @@ def train(
                 total_loss = target_loss
 
             gate_top_k_idx, gate_score, expert_distr = gate_scores
-            seq_len = expert_distr.shape[0] # на самом деле это batch_size * seq_len
-            raise Exception(expert_distr.shape)
+            seq_len = expert_distr.shape[0]
+            expert_distr_by_device = expert_distr.reshape(seq_len, config.world_size, config.num_experts_per_device)
 
-            B, S = config.batch_size, config.seq_len
-
-            expert_distr_by_device = expert_distr.view(B, S, config.world_size, config.num_experts_per_device) # seq_len x world_size x num_experts_per_device
-
-            fashions = expert_distr_by_device.max(dim=-1).values     # (batch, seq, world)
-            dist2   = (expert_distr_by_device**2).mean(dim=-1)        # (batch, seq, world)
-            fash2   = (fashions**2).mean(dim=-1)                     # (batch, seq)
-            loss_dist    = dist2.mean()      # scalar
-            loss_fashion = fash2.mean()      # scalar
+            fashions_on_experts = expert_distr_by_device.max(dim=-1).values
+            norm2_expert_distr_by_device = torch.mean(expert_distr_by_device**2, dim=-1)
+            norm2_fashions_on_experts = torch.mean(fashions_on_experts**2, dim=-1)
+            
+            loss_dist = torch.mean(norm2_expert_distr_by_device)
+            loss_fashion = torch.mean(norm2_fashions_on_experts)
 
             total_loss = total_loss + config.lambda_2 * loss_dist - config.lambda_1 * loss_fashion
 
@@ -102,12 +97,25 @@ def train(
 
             config.metrics.train_losses.target_loss.append(target_loss.item())
             config.metrics.train_losses.balance_loss.append(balance_loss.item() if cnt > 0 else 0.0)
-
             config.metrics.train_losses.distribution_loss.append(loss_dist.item())
             config.metrics.train_losses.fashion_loss.append(loss_fashion.item())
- 
+
+            loop.set_postfix({
+                'target': f"{target_loss.item():.4f}",
+                'balance': f"{balance_loss.item() if cnt > 0 else 0.0:.4f}",
+                'dist': f"{loss_dist.item():.4f}",
+                'fashion': f"{loss_fashion.item():.4f}",
+                'total': f"{total_loss.item():.4f}",
+                'alpha': f"{config.alpha:.2f}",
+                'lambda1': f"{config.lambda_1:.2f}",
+                'lambda2': f"{config.lambda_2:.2f}"
+            })
+
             if global_iter % config.log_interval == 0:
-                
+                timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+                out_name = f"traincfg_alpha{config.alpha:.2f}_{timestamp}.json"
+                config.to_json(out_name)
+
                 model.eval()
                 val_losses = []
                 with torch.no_grad():
@@ -140,9 +148,6 @@ def train(
     out_name = f"traincfg_alpha{config.alpha:.2f}_{timestamp}.json"
     config.to_json(out_name)
     print(f"✅ Training finished. Config with metrics saved to {out_name}")
-
-
-
 
 def run_with_alphas(alphas, config: TrainConfig):
     train_loader = create_wikitext_dataloader(config.batch_size, config.seq_len, split="train")
