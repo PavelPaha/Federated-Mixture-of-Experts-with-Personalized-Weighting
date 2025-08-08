@@ -11,7 +11,7 @@ class TrainConfig:
     alpha: float = 0.2
     lambda_1: float = 0.0
     lambda_2: float = 0.0
-    log_interval: int = 1000
+    log_interval: int = 500
     epochs: int = 15
     num_experts_per_device: int = 5
     world_size: int = 2

@@ -167,10 +167,11 @@ def train_single_alpha(gpu_id, ds_train, ds_validation, config: TrainConfig, res
         padding_idx=tokenizer.pad_token_id
     ).to(device)
 
-    optimizer = optim.AdamW(model.parameters(), lr=config.lr, betas=(0.9, 0.999), eps=1e-8, weight_decay=0.01)
+    optimizer = optim.Adam(model.parameters(), lr=config.lr)
     criterion = nn.CrossEntropyLoss(ignore_index=tokenizer.pad_token_id)
 
-    tokens_total = 117920140.
+    # tokens_total = 117920140.
+    tokens_total = 2391884
     len_loader = tokens_total / (config.batch_size * config.seq_len)
     total_steps = config.epochs * len_loader
 
@@ -213,9 +214,9 @@ def train_single_alpha(gpu_id, ds_train, ds_validation, config: TrainConfig, res
                 if hasattr(m, "gate") and getattr(m.gate, "has_loss", False):
                     balance_loss += m.gate.get_loss()
                     cnt += 1
-            balance_loss = (balance_loss / cnt) if cnt > 0 else 0.0
+            # balance_loss = (balance_loss / cnt) if cnt > 0 else 0.0
 
-            total_loss = target_loss / 4. + current_alpha * balance_loss
+            total_loss = target_loss / 10. + current_alpha * balance_loss
             total_loss.backward()
             # torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             optimizer.step()
@@ -226,6 +227,7 @@ def train_single_alpha(gpu_id, ds_train, ds_validation, config: TrainConfig, res
             config.metrics.hyperparams.append({'iter': global_iter, 'alpha': current_alpha})
             collect_gate_distribution(model, global_iter, config.metrics)
             config.metrics.schedule_hist.append(current_alpha)
+            
 
             loop.set_postfix({
                 'loss': f"{total_loss.item():.4f}",
@@ -291,96 +293,67 @@ def train_single_alpha(gpu_id, ds_train, ds_validation, config: TrainConfig, res
         'metrics': config.metrics.to_dict()
     })
 
-def run_parallel_training(configs, gpu_ids: list[int], max_per_gpu: int = 2):
-    ds_train = load_dataset(
-        "wikitext", "wikitext-103-v1", split='train', streaming=False
-    )
-    ds_validation = load_dataset(
-        "wikitext", "wikitext-103-v1", split='validation', streaming=False
-    )
 
-    visible = gpu_ids.copy()
-    if not visible:
-        raise RuntimeError("Список gpu_ids пуст — нет доступных GPU для запуска.")
+from multiprocessing import Process, Queue
+from datasets import load_dataset
 
-    remaining = configs.copy()
+def run_experiments_on_gpu(gpu_id, cfg_list, ds_train, ds_validation, result_queue):
+    for cfg in cfg_list:
+        cfg.gpu_id = gpu_id
+        print(f"▶ started: schedule={cfg.schedule_type}, alpha={cfg.alpha} on GPU {gpu_id}")
+        train_single_alpha(gpu_id, ds_train, ds_validation, cfg, result_queue)
+        print(f"✔ finished: schedule={cfg.schedule_type}, alpha={cfg.alpha} on GPU {gpu_id}")
+
+
+def run_parallel_training(configs, gpu_ids: list[int]):
+    ds_train = load_dataset("wikitext", "wikitext-2-v1", split='train')
+    ds_validation = load_dataset("wikitext", "wikitext-2-v1", split='validation')
+
     result_queue = Queue()
-    active: dict[int, list[Process]] = {gpu: [] for gpu in visible}
 
-    try:
-        while remaining or any(active.values()):
-            # Запускаем на доступных GPU
-            for phys_gpu in visible:
-                # Проверяем, есть ли ещё место на этой карте
-                if len(active[phys_gpu]) >= max_per_gpu:
-                    continue
-                if not remaining:
-                    break
+    # распределяем конфиги по GPU
+    configs_per_gpu = {gpu: [] for gpu in gpu_ids}
+    for i, cfg in enumerate(configs):
+        gpu = gpu_ids[i % len(gpu_ids)]
+        configs_per_gpu[gpu].append(cfg)
 
-                cfg = remaining.pop(0)
-                cfg.gpu_id = phys_gpu
+    procs = []
+    for gpu_id, cfg_list in configs_per_gpu.items():
+        if not cfg_list:
+            continue
+        p = Process(
+            target=run_experiments_on_gpu,
+            args=(gpu_id, cfg_list, ds_train, ds_validation, result_queue)
+        )
+        p.start()
+        procs.append(p)
 
-                p = Process(
-                    target=train_single_alpha,
-                    args=(phys_gpu, ds_train, ds_validation, cfg, result_queue)
-                )
-                p.start()
-                active[phys_gpu].append(p)
-                print(f"▶ started: schedule={cfg.schedule_type}, alpha={cfg.alpha} "
-                      f"on GPU {phys_gpu}, pid={p.pid}")
+    for p in procs:
+        p.join()
 
-            time.sleep(1.0)
+    results = []
+    while not result_queue.empty():
+        results.append(result_queue.get_nowait())
 
-            for phys_gpu in visible:
-                still_alive = []
-                for proc in active[phys_gpu]:
-                    if proc.is_alive():
-                        still_alive.append(proc)
-                    else:
-                        proc.join(timeout=0)
-                        print(f"✔ finished on GPU {phys_gpu} (pid={proc.pid}), exitcode={proc.exitcode}")
-                active[phys_gpu] = still_alive
-
-        # Собираем результаты
-        results = []
-        while not result_queue.empty():
-            try:
-                results.append(result_queue.get_nowait())
-            except Exception:
-                break
-
-        print("✅ Все эксперименты завершены")
-        for result in results:
-            print(f"  Schedule={result['schedule']}, Alpha={result['alpha_base']:.2f} "
-                  f"on GPU {result['gpu_id']}")
-        return results
-
-    except KeyboardInterrupt:
-        print("⛔ Прервано пользователем — завершаем процессы...")
-        for proc_list in active.values():
-            for proc in proc_list:
-                try:
-                    proc.terminate()
-                except Exception:
-                    pass
-        raise
+    print("✅ Все эксперименты завершены")
+    return results
 
 
 if __name__ == "__main__":
-    gpu_ids = [0, 2, 4, 6, 7]   
+    gpu_ids = [7, 6]   
     base_alphas = [round(x * 0.2, 2) for x in range(0, 6)]
     configs: list[TrainConfig] = []
 
-    for i, a in enumerate(base_alphas):
-        c = TrainConfig()
-        c.alpha = a
-        c.schedule_type = 'constant'
-        c.warmup_steps = 0
-        c.gpu_id = gpu_ids[i % len(gpu_ids)]
-        configs.append(c)
+    # for i, a in enumerate(base_alphas):
+    #     c = TrainConfig()
+    #     c.alpha = a
+    #     c.schedule_type = 'constant'
+    #     c.warmup_steps = 0
+    #     c.gpu_id = gpu_ids[i % len(gpu_ids)]
+    #     configs.append(c)
 
     # 2) Для alpha в {0.2, 0.5, 0.7} — все расписания КРОМЕ 'constant'
-    test_alphas = [0.2, 0.5, 0.7]
+    test_alphas = [1, 5, 10, 100]
     all_schedules = [
         'linear', 'cosine', 'exp', 'cosine_increase', 'exp_increase',
         'cosine_rise_decay', 'sawtooth', 'cosine_hold'
@@ -392,9 +365,9 @@ if __name__ == "__main__":
             c.schedule_type = sch
             c.warmup_steps = 1000
             if sch == 'cosine_hold':
-                c.hold_steps = 2000
+                c.hold_steps = 1000
             if sch == 'sawtooth':
-                c.period = 3000
+                c.period = 1000
             c.gpu_id = gpu_ids[(j * len(all_schedules) + k) % len(gpu_ids)]
             configs.append(c)
 
