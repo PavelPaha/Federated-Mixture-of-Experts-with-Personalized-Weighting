@@ -6,6 +6,7 @@ import torch.nn as nn
 from fmoe.transformer import FMoETransformerMLP
 # from my_gshard import GShardGate
 from my_gate import MyGate
+from gumbel_gate import GumbelGate
 
 
 class TransformerLayer(nn.Module):
@@ -22,7 +23,7 @@ class TransformerLayer(nn.Module):
             activation=nn.GELU(),
             expert_dp_comm="none",
             expert_rank=0,
-            gate=MyGate,
+            gate=GumbelGate,
             gate_hook=gate_hook
         )
         self.norm2 = nn.LayerNorm(d_model)

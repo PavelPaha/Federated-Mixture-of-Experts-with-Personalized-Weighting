@@ -11,6 +11,9 @@ import datetime
 import time
 from multiprocessing import Queue
 from datasets import load_dataset
+import math
+import torch.optim as optim
+from torch.optim.lr_scheduler import LambdaLR
 
 from model import TransformerWithMoE
 from data import create_wikitext_dataloader, tokenizer
@@ -20,6 +23,46 @@ vocab_size = tokenizer.vocab_size + 1
 import math
 import torch
 from typing import Optional
+
+def make_cosine_after_warmup_scheduler(optimizer,
+                                       warmup_steps: int = 1000,
+                                       decay_steps: int = 9000,
+                                       min_lr: float = 0.0):
+    """
+    Возвращает LambdaLR, который:
+      - держит lr = base_lr первые warmup_steps итераций;
+      - потом применяет косинусный спад от base_lr до min_lr в течение decay_steps;
+      - если итерации > warmup_steps + decay_steps, lr = min_lr.
+    Поддерживает несколько param_groups (каждому своя шкала min_ratio).
+    """
+    lr_lambdas = []
+    for group in optimizer.param_groups:
+        base_lr = float(group.get("lr", 0.0))
+        # защита от деления на 0
+        if base_lr <= 0.0:
+            min_ratio = 0.0
+        else:
+            min_ratio = float(min_lr) / base_lr
+
+        # закрытие значений, чтобы не захватить изменяемые переменные в цикле
+        def _make_fn(warmup=warmup_steps, decay=decay_steps, min_r=min_ratio):
+            def lr_multiplier(step: int):
+                if step < 0:
+                    step = 0
+                if step < warmup:
+                    return 1.0
+                # прогресс в [0,1]
+                prog = (step - warmup) / float(max(1, decay))
+                if prog >= 1.0:
+                    return min_r
+                # косинусная интерполяция от 1.0 -> min_r
+                return min_r + 0.5 * (1.0 - min_r) * (1.0 + math.cos(math.pi * prog))
+            return lr_multiplier
+
+        lr_lambdas.append(_make_fn())
+
+    return LambdaLR(optimizer, lr_lambdas)
+
 
 def get_alpha_scheduler(
     schedule_type: str,
@@ -31,25 +74,6 @@ def get_alpha_scheduler(
     warmup_strategy: str = "linear",
     rise_fraction: float = 0.5,
 ):
-    """
-    Расширенный планировщик для alpha с новыми типами расписаний:
-    
-    Параметры:
-        schedule_type: Один из:
-            - 'constant' (постоянный)
-            - 'linear' (линейный спад)
-            - 'cosine' (косинусный спад)
-            - 'exp' (экспоненциальный спад)
-            - 'cosine_rise' (рост по косинусу + спад)
-            - 'exp_rise' (рост экспоненциально + спад)
-            - 'sawtooth' (пилообразный периодический)
-            - 'cosine_hold' (плато + косинусный спад)
-        base_alpha: Максимальное значение alpha
-        total_steps: Общее число шагов
-        warmup_steps: Число шагов для разогрева
-        period: Период для пилообразного расписания
-        hold_steps: Число шагов удержания максимума для cosine_hold
-    """
     aliases = {
         "exponential": "exp",
         "exp_decay": "exp",
@@ -63,6 +87,10 @@ def get_alpha_scheduler(
     schedule_type = aliases.get(schedule_type, schedule_type)
 
     def scheduler(step: int):
+        # локальные копии параметров, чтобы не переписывать внешние переменные
+        period_local = period
+        hold_local = hold_steps
+
         if schedule_type == 'cosine_increase':
             if step < warmup_steps:
                 return 0.0
@@ -78,25 +106,24 @@ def get_alpha_scheduler(
         if step < warmup_steps:
             if warmup_strategy == "zero":
                 return 0.0
-            # по умолчанию линейный разогрев
             return base_alpha * float(step) / float(max(1, warmup_steps))
-        
-        # Основные фазы
+
         adjusted_step = step - warmup_steps
-        adjusted_total = total_steps - warmup_steps
-        progress = float(adjusted_step) / float(max(1, adjusted_total))
-        
+        adjusted_total = max(1, total_steps - warmup_steps)
+        progress = float(adjusted_step) / float(adjusted_total)
+
         if schedule_type == 'constant':
             return base_alpha
-            
+
         elif schedule_type == 'linear':
             return base_alpha * (1 - progress)
-            
+
         elif schedule_type == 'cosine':
             return base_alpha * 0.5 * (1 + math.cos(math.pi * progress))
-            
+
         elif schedule_type == 'exp':
             return base_alpha * (0.1 ** progress)
+
         elif schedule_type == 'exp_increase':
             return base_alpha * (1.0 - (0.1 ** progress))
 
@@ -108,35 +135,36 @@ def get_alpha_scheduler(
             else:
                 local = (progress - rf) / (1.0 - rf)
                 return base_alpha * 0.5 * (1 + math.cos(math.pi * local))
-                
+
         elif schedule_type == 'sawtooth':
-            if period is None:
-                period = adjusted_total // 4
-            cycle_pos = adjusted_step % period
-            return base_alpha * (1 - cycle_pos / period)
-            
+            if period_local is None:
+                period_local = max(1, adjusted_total // 4)
+            cycle_pos = adjusted_step % period_local
+            return base_alpha * (1 - cycle_pos / float(period_local))
+
         elif schedule_type == 'cosine_hold':
-            if hold_steps is None:
-                hold_steps = adjusted_total // 3
-            if adjusted_step < hold_steps:
+            if hold_local is None:
+                hold_local = max(1, adjusted_total // 3)
+            if adjusted_step < hold_local:
                 return base_alpha
             else:
-                hold_progress = (adjusted_step - hold_steps) / (adjusted_total - hold_steps)
+                hold_progress = (adjusted_step - hold_local) / float(max(1, adjusted_total - hold_local))
                 return base_alpha * 0.5 * (1 + math.cos(math.pi * hold_progress))
-                
+
         else:
             raise ValueError(f"Unknown schedule type: {schedule_type}")
-    
+
     return scheduler
 
 
-# gate_scores = None
-# def get_scores(module, inp, out, idx=0):
-#     global gate_scores
-#     # global gate_scores
-#     gate_scores = module.raw_forward(inp[0], return_all_scores=True)
-#     # print(gate_scores[-1].shape)
+gate_scores = None
+def get_scores(module, inp, out):
+    # print(f'module = {module}, inp = {inp}, out = {out}')
+    # global gate_scores
+    pass
+    # gate_scores = module.last_gate_logits
 
+    
 
 def collect_gate_distribution(model, global_iter, metrics):
     try:
@@ -154,6 +182,9 @@ def train_single_alpha(gpu_id, ds_train, ds_validation, config: TrainConfig, res
     torch.cuda.set_device(gpu_id)
     device = f'cuda:{gpu_id}'
 
+    warmup_steps = 1000          # старт по твоему запросу
+    decay_steps = 12000           # сколько итераций занимает спад (настрой)
+    min_lr = 0.0                 # минимальный LR в конце спада
     train_loader = create_wikitext_dataloader(ds_train, config.batch_size, config.seq_len)
     test_loader = create_wikitext_dataloader(ds_validation, config.batch_size, config.seq_len)
 
@@ -164,14 +195,22 @@ def train_single_alpha(gpu_id, ds_train, ds_validation, config: TrainConfig, res
         config.num_experts_per_device,
         config.world_size,
         config.top_k,
-        padding_idx=tokenizer.pad_token_id
+        padding_idx=tokenizer.pad_token_id,
+        gate_hook=get_scores
     ).to(device)
 
     optimizer = optim.Adam(model.parameters(), lr=config.lr)
     criterion = nn.CrossEntropyLoss(ignore_index=tokenizer.pad_token_id)
 
-    # tokens_total = 117920140.
-    tokens_total = 2391884
+    scheduler = make_cosine_after_warmup_scheduler(
+        optimizer,
+        warmup_steps=warmup_steps,
+        decay_steps=decay_steps,
+        min_lr=min_lr
+    )
+
+    tokens_total = 117920140.
+    # tokens_total = 2391884
     len_loader = tokens_total / (config.batch_size * config.seq_len)
     total_steps = config.epochs * len_loader
 
@@ -192,7 +231,7 @@ def train_single_alpha(gpu_id, ds_train, ds_validation, config: TrainConfig, res
     config.metrics = Metrics()
     global_iter = 0
 
-    ckpt_dir = f"{config.schedule_type}_alpha{config.alpha:.2f}_gpu{gpu_id}"
+    ckpt_dir = f"metrics_gumbel/{config.schedule_type}_alpha{config.alpha:.2f}_gpu{gpu_id}"
 
     for epoch in range(1, config.epochs + 1):
         loop = tqdm(enumerate(train_loader, 1),
@@ -214,13 +253,28 @@ def train_single_alpha(gpu_id, ds_train, ds_validation, config: TrainConfig, res
                 if hasattr(m, "gate") and getattr(m.gate, "has_loss", False):
                     balance_loss += m.gate.get_loss()
                     cnt += 1
-            # balance_loss = (balance_loss / cnt) if cnt > 0 else 0.0
+            balance_loss = (balance_loss / cnt) if cnt > 0 else 0.0
 
-            total_loss = target_loss / 10. + current_alpha * balance_loss
+            # gate_top_k_idx, gate_score, expert_distr = gate_scores
+            # seq_len = expert_distr.shape[0]
+            # expert_distr_by_device = expert_distr.reshape(seq_len, config.world_size, config.num_experts_per_device)
+
+            # fashions_on_experts = expert_distr_by_device.max(dim=-1).values
+            # norm2_expert_distr_by_device = torch.mean(expert_distr_by_device**2, dim=-1)
+            # norm2_fashions_on_experts = torch.mean(fashions_on_experts**2, dim=-1)
+            
+            # loss_dist = torch.mean(norm2_expert_distr_by_device)
+            # loss_fashion = torch.mean(norm2_fashions_on_experts)
+
+            # total_loss = total_loss + config.lambda_2 * loss_dist - config.lambda_1 * loss_fashion
+
+            total_loss = target_loss + current_alpha * balance_loss
             total_loss.backward()
             # torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            
             optimizer.step()
 
+            scheduler.step() 
             config.metrics.train_losses.target_loss.append(target_loss.item())
             config.metrics.train_losses.balance_loss.append(
                 balance_loss if isinstance(balance_loss, float) else balance_loss.item())
@@ -232,7 +286,7 @@ def train_single_alpha(gpu_id, ds_train, ds_validation, config: TrainConfig, res
             loop.set_postfix({
                 'loss': f"{total_loss.item():.4f}",
                 't_loss': f"{target_loss.item():.4f}",
-                'b_loss': f"{balance_loss:.4f}",
+                'b_loss': f"{balance_loss.item():.4f}",
                 'alpha': f"{current_alpha:.4f}" 
             })
 
@@ -306,8 +360,8 @@ def run_experiments_on_gpu(gpu_id, cfg_list, ds_train, ds_validation, result_que
 
 
 def run_parallel_training(configs, gpu_ids: list[int]):
-    ds_train = load_dataset("wikitext", "wikitext-2-v1", split='train')
-    ds_validation = load_dataset("wikitext", "wikitext-2-v1", split='validation')
+    ds_train = load_dataset("wikitext", "wikitext-103-v1", split='train')
+    ds_validation = load_dataset("wikitext", "wikitext-103-v1", split='validation')
 
     result_queue = Queue()
 
@@ -340,9 +394,15 @@ def run_parallel_training(configs, gpu_ids: list[int]):
 
 
 if __name__ == "__main__":
-    gpu_ids = [7, 6]   
-    base_alphas = [round(x * 0.2, 2) for x in range(0, 6)]
-    configs: list[TrainConfig] = []
+    gpu_ids = [0]   
+    # base_alphas = [round(x * 0.2, 2) for x in range(0, 6)]
+    # base_alphas = [1, 5, 10, 25, 50, 100, 200]
+    base_alphas = [0.1, 0.3, 0.5, 0.7]
+
+    c = TrainConfig()
+    c.alpha = 1
+    c.schedule_type = 'exp'
+    configs: list[TrainConfig] = [c]
 
     # for i, a in enumerate(base_alphas):
     #     c = TrainConfig()
@@ -352,23 +412,27 @@ if __name__ == "__main__":
     #     c.gpu_id = gpu_ids[i % len(gpu_ids)]
     #     configs.append(c)
 
-    # 2) Для alpha в {0.2, 0.5, 0.7} — все расписания КРОМЕ 'constant'
-    test_alphas = [1, 5, 10, 100]
-    all_schedules = [
-        'linear', 'cosine', 'exp', 'cosine_increase', 'exp_increase',
-        'cosine_rise_decay', 'sawtooth', 'cosine_hold'
-    ]
-    for j, a in enumerate(test_alphas):
-        for k, sch in enumerate(all_schedules):
-            c = TrainConfig()
-            c.alpha = a
-            c.schedule_type = sch
-            c.warmup_steps = 1000
-            if sch == 'cosine_hold':
-                c.hold_steps = 1000
-            if sch == 'sawtooth':
-                c.period = 1000
-            c.gpu_id = gpu_ids[(j * len(all_schedules) + k) % len(gpu_ids)]
-            configs.append(c)
+    # # 2) Для alpha в {0.2, 0.5, 0.7} — все расписания КРОМЕ 'constant'
+    # test_alphas = [1]
+    # all_schedules = ['constant']
+    # lambdas1 = [0.1, 0.5, 0.7]
+    # lambdas2 = [0.1, 0.5, 0.7]
+
+    # for j, a in enumerate(test_alphas):
+    #     for k, sch in enumerate(all_schedules):
+    #         for l1 in lambdas1:
+    #             for l2 in lambdas2:
+    #                 c = TrainConfig()
+    #                 c.alpha = a
+    #                 c.schedule_type = sch
+    #                 c.warmup_steps = 1000
+    #                 c.lambda_1 = l1
+    #                 c.lambda_2 = l2
+    #                 if sch == 'cosine_hold':
+    #                     c.hold_steps = 1000
+    #                 if sch == 'sawtooth':
+    #                     c.period = 1000
+    #                 c.gpu_id = gpu_ids[(j * len(all_schedules) + k) % len(gpu_ids)]
+    #                 configs.append(c)
 
     run_parallel_training(configs, gpu_ids)

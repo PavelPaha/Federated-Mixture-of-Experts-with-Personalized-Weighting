@@ -12,14 +12,14 @@ class TrainConfig:
     lambda_1: float = 0.0
     lambda_2: float = 0.0
     log_interval: int = 500
-    epochs: int = 15
+    epochs: int = 1
     num_experts_per_device: int = 5
     world_size: int = 2
     d_model: int = 256
     num_layers: int = 3
     top_k: int = 1
     seq_len: int = 256
-    batch_size: int = 16
+    batch_size: int = 32
     lr: float = 4e-4
     metrics: Metrics = field(default_factory=Metrics)
     schedule_type: str = 'constant'  # 'constant', 'linear', 'cosine', 'exponential', 'cosine_rise', 'exp_rise', 'sawtooth', 'cosine_hold', 'cosine_increase', 'exp_increase', 'cosine_rise_decay'
