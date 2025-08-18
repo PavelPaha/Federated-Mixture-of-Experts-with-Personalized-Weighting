@@ -43,25 +43,3 @@ class TrainConfig:
             d["metrics"] = self.metrics.to_dict()
         with open(path, "w") as f:
             json.dump(d, f, indent=4)
-
-    @staticmethod
-    def visualize_metrics(metrics_path="metrics.pkl"):
-        import pickle
-        with open(metrics_path, 'rb') as f:
-            metrics = pickle.load(f)
-
-        plt.figure(figsize=(12, 5))
-        plt.subplot(1, 2, 1)
-        plt.plot(metrics['iter'], metrics['train_main'], label="Main Loss")
-        plt.plot(metrics['iter'], metrics['train_total'], label="Total Loss")
-        plt.plot(metrics['iter'], metrics['train_balance'], label="Balance Loss")
-        plt.legend()
-        plt.title("Train Losses")
-
-        plt.subplot(1, 2, 2)
-        plt.plot(range(len(metrics['test_loss'])), metrics['test_loss'], label="Test Loss", color="orange")
-        plt.legend()
-        plt.title("Test Loss")
-
-        plt.tight_layout()
-        plt.show()
