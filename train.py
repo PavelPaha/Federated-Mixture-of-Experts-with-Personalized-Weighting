@@ -6,6 +6,8 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 from tqdm import tqdm
+import matplotlib.pyplot as plt
+import io
 
 from datasets import load_dataset
 from data import create_wikitext_dataloader, tokenizer
@@ -27,6 +29,68 @@ def calc_balance_loss(model, device):
     return balance_loss
 
 
+def evaluate_model(model, dataloader, criterion, device):
+    """Функция для валидации модели"""
+    model.eval()
+    total_loss = 0.0
+    total_balance_loss = 0.0
+    num_batches = 0
+
+    max_steps = 1000
+    
+    with torch.no_grad():
+        for i, batch in enumerate(tqdm(dataloader, desc="Evaluating")):
+            if i >= max_steps:
+                break
+            
+            inp, tgt = batch
+            inp, tgt = inp.to(device), tgt.to(device)
+            
+            logits = model(inp)
+            ce_loss = criterion(logits.view(-1, logits.size(-1)), tgt.view(-1))
+            balance_loss = calc_balance_loss(model, device)
+            
+            total_loss += ce_loss.item()
+            total_balance_loss += balance_loss.item()
+            num_batches += 1
+    
+    model.train()
+    return total_loss / num_batches, total_balance_loss / num_batches
+
+
+def log_gate_distributions(model, step, mlflow):
+    """Логирует распределение использования экспертов из всех гейтов модели"""
+    for layer_idx, layer in enumerate(model.layers):
+        if hasattr(layer, 'moe') and hasattr(layer.moe, 'gate'):
+            gate = layer.moe.gate
+            if hasattr(gate, 'get_gate_distribution'):
+                expert_usage, gate_weights = gate.get_gate_distribution(clear=True)
+                if expert_usage is not None and gate_weights is not None:
+                    # Создаем график распределения
+                    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 5))
+                    
+                    # График количества использований экспертов
+                    expert_indices = range(len(expert_usage))
+                    ax1.bar(expert_indices, expert_usage.numpy(), color='skyblue', alpha=0.7)
+                    ax1.set_title(f'Layer {layer_idx}: Expert Usage Probability (Mean)')
+                    ax1.set_xlabel('Expert Index')
+                    ax1.set_ylabel('Mean Probability')
+                    ax1.grid(True, alpha=0.3)
+                    
+                    # График средних весов экспертов
+                    ax2.bar(expert_indices, gate_weights.numpy(), color='lightcoral', alpha=0.7)
+                    ax2.set_title(f'Layer {layer_idx}: Expert Weight Standard Deviation')
+                    ax2.set_xlabel('Expert Index')
+                    ax2.set_ylabel('Standard Deviation')
+                    ax2.grid(True, alpha=0.3)
+                    
+                    plt.tight_layout()
+                    
+                    # Логируем график в MLflow
+                    mlflow.log_figure(fig, f"gate_distributions/layer_{layer_idx}_step_{step}.png")                
+                    plt.close(fig)
+
+
 @hydra.main(config_path="configs", config_name="config", version_base=None)
 def main(cfg: DictConfig):
     print(OmegaConf.to_yaml(cfg))
@@ -35,18 +99,39 @@ def main(cfg: DictConfig):
     with mlflow.start_run(run_name=cfg.experiment.name):
         mlflow.log_params(OmegaConf.to_container(cfg, resolve=True))
 
-        raw_dataset = load_dataset("wikitext", cfg.training.dataset_name, split="train")
-        dataloader = create_wikitext_dataloader(
-            raw_dataset,
+        # Загружаем тренировочные данные
+        raw_train_dataset = load_dataset("wikitext", cfg.training.dataset_name, split="train")
+        train_dataloader = create_wikitext_dataloader(
+            raw_train_dataset,
             batch_size=cfg.training.batch_size,
             seq_len=cfg.training.seq_len,
             num_workers=cfg.training.num_workers,
+            shuffle=True,
+            streaming=cfg.training.streaming,  # Используем параметр из конфигурации
+        )
+        
+        # Загружаем валидационные данные
+        raw_val_dataset = load_dataset("wikitext", cfg.training.dataset_name, split="validation")
+        val_dataloader = create_wikitext_dataloader(
+            raw_val_dataset,
+            batch_size=cfg.validation.batch_size,
+            seq_len=cfg.training.seq_len,
+            num_workers=cfg.validation.num_workers,
+            shuffle=False,  # Валидация без перемешивания
+            streaming=False,  # Используем параметр из конфигурации
         )
 
         alpha_sched = instantiate(cfg.alpha_schedule, total_steps=cfg.training.total_steps)
 
         vocab_size = len(tokenizer)
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        # Используем указанный в конфигурации GPU ID
+        if torch.cuda.is_available():
+            device = torch.device(f'cuda:{cfg.training.gpu_id}')
+            # Устанавливаем текущий GPU
+            torch.cuda.set_device(device)
+        else:
+            device = torch.device("cpu")
+        
         model = TransformerWithMoE(
             vocab_size=vocab_size,
             d_model=cfg.model.d_model,
@@ -64,43 +149,91 @@ def main(cfg: DictConfig):
 
         pbar = tqdm(total=total_steps, desc="Training", unit="step")
 
+        # Переменные для накопления loss за log_interval шагов
+        accumulated_loss = 0.0
+        accumulated_ce_loss = 0.0
+        accumulated_balance_loss = 0.0
+        accumulated_steps = 0
+
         model.train()
-        while global_step < total_steps:
-            for batch in dataloader:
-                inp, tgt = batch
-                # quick sanity check (debugging): убедиться, что id < vocab_size
-                if inp.max().item() >= vocab_size or tgt.max().item() >= vocab_size:
-                    raise ValueError(f"Token id exceeds vocab size: max(inp)={inp.max().item()}, vocab_size={vocab_size}")
-
-                inp, tgt = inp.to(device), tgt.to(device)
-
-                optimizer.zero_grad()
-                logits = model(inp)
-                ce_loss = criterion(logits.view(-1, logits.size(-1)), tgt.view(-1))
+        for batch in train_dataloader:
+            if global_step >= total_steps:
+                # print("global_step >= total_steps")
+                break
                 
-                balance_loss = calc_balance_loss(model, f'cuda:{cfg.training.gpu_id}')    
-                loss = ce_loss + alpha_sched.get_value() * balance_loss
+            # print(f"Processing step {global_step}")
+            inp, tgt = batch
+            inp, tgt = inp.to(device), tgt.to(device)
 
-                loss.backward()
-                optimizer.step()
+            optimizer.zero_grad()
+            logits = model(inp)
+            ce_loss = criterion(logits.view(-1, logits.size(-1)), tgt.view(-1))
+            # print('aboba')
+            
+            balance_loss = calc_balance_loss(model, device)    
+            loss = ce_loss + alpha_sched.get_value() * balance_loss
 
-                if global_step % cfg.training.log_interval == 0:
-                    mean_balance_loss = balance_loss / cfg.model.num_layers
-                    ppl = torch.exp(ce_loss).item()
-                    mlflow.log_metric("loss", loss.item(), step=global_step)
-                    mlflow.log_metric("ce_loss", ce_loss.item(), step=global_step)
-                    mlflow.log_metric("mean_balance_loss", mean_balance_loss.item(), step=global_step)
-                    mlflow.log_metric("perplexity", ppl, step=global_step)
-                    mlflow.log_metric("alpha_sched", alpha_sched.get_value(), step=global_step)
-                    pbar.set_postfix(loss=loss.item(), ce=ce_loss.item(), mean_balance=mean_balance_loss.item(), ppl=ppl)
+            loss.backward()
+            optimizer.step()
 
-                global_step += 1
-                alpha_sched.step()
-                pbar.update(1)
-                if global_step >= total_steps:
-                    break
+            # Вычисляем mean_balance_loss на каждом шаге для tqdm
+            mean_balance_loss = balance_loss / cfg.model.num_layers
 
-            mlflow.pytorch.log_model(model, artifact_path="model")
+            # Накопление loss для среднего
+            accumulated_loss += loss.item()
+            accumulated_ce_loss += ce_loss.item()
+            accumulated_balance_loss += mean_balance_loss.item()
+            accumulated_steps += 1
+
+            # print('asdfasdf')
+
+            # Логгирование каждые 100 шагов
+            if global_step % cfg.training.log_interval == 0:
+                # Вычисляем средние значения за log_interval шагов
+                avg_loss = accumulated_loss / accumulated_steps
+                avg_ce_loss = accumulated_ce_loss / accumulated_steps
+                avg_balance_loss = accumulated_balance_loss / accumulated_steps
+                avg_ppl = torch.exp(torch.tensor(avg_ce_loss)).item()
+                
+                # Логируем средние значения
+                mlflow.log_metric("train_loss_avg", avg_loss, step=global_step)
+                mlflow.log_metric("train_ce_loss_avg", avg_ce_loss, step=global_step)
+                mlflow.log_metric("train_mean_balance_loss_avg", avg_balance_loss, step=global_step)
+                mlflow.log_metric("train_perplexity_avg", avg_ppl, step=global_step)
+                mlflow.log_metric("alpha_sched", alpha_sched.get_value(), step=global_step)
+                
+                # Сбрасываем накопленные значения
+                accumulated_loss = 0.0
+                accumulated_ce_loss = 0.0
+                accumulated_balance_loss = 0.0
+                accumulated_steps = 0
+                
+            # Обновляем tqdm на каждом шаге
+            pbar.set_postfix(
+                loss=f"{loss.item():.4f}", 
+                ce=f"{ce_loss.item():.4f}", 
+                mean_balance=f"{mean_balance_loss.item():.4f}"
+            )
+
+            # print('12323')
+            # Валидация каждые 1000 шагов
+            if global_step % cfg.training.eval_interval == 0:
+                val_ce_loss, val_balance_loss = evaluate_model(model, val_dataloader, criterion, device)
+                val_ppl = torch.exp(torch.tensor(val_ce_loss)).item()
+                mean_val_balance_loss = val_balance_loss / cfg.model.num_layers
+                
+                mlflow.log_metric("val_ce_loss", val_ce_loss, step=global_step)
+                mlflow.log_metric("val_mean_balance_loss", mean_val_balance_loss, step=global_step)
+                mlflow.log_metric("val_perplexity", val_ppl, step=global_step)
+
+            if global_step % 500 == 0:
+                log_gate_distributions(model, global_step, mlflow)
+
+            global_step += 1
+            alpha_sched.step()
+            pbar.update(1)
+
+        # mlflow.pytorch.log_model(model, artifact_path="model")
 
 
 if __name__ == "__main__":

@@ -19,8 +19,8 @@ logging.basicConfig(
 )
 
 # Конфигурация GPU
-AVAILABLE_GPUS = [5, 6, 7]
-EXCLUDED_DATASETS = ["wikitext2"]
+AVAILABLE_GPUS = [2, 3, 4, 5, 6, 7]
+INCLUDED_DATASETS = ["wikitext103"]
 
 def get_all_experiments():
     """Получает список всех экспериментов, исключая wikitext103"""
@@ -28,11 +28,11 @@ def get_all_experiments():
     experiment_paths = []
     
     for dataset_dir in experiments_dir.iterdir():
-        if dataset_dir.is_dir() and dataset_dir.name in EXCLUDED_DATASETS:
+        if dataset_dir.is_dir() and dataset_dir.name in INCLUDED_DATASETS:
             for config_file in dataset_dir.glob("*.yaml"):
                 experiment_paths.append(str(config_file))
     
-    return sorted(experiment_paths)
+    return sorted(experiment_paths, reverse=True)
 
 def run_experiment_on_gpu(experiment_path: str, gpu_id: int):
     """Запускает эксперимент на указанной GPU с выводом в реальном времени"""

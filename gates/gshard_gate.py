@@ -44,5 +44,8 @@ class GShardGate(BaseGate):
 
         # сохраняем лосс в гейте
         self.set_loss(balance_loss)
+        
+        # сохраняем выход гейта для логирования
+        self.save_gate_output(scores)
 
         return top_scores, top_indices

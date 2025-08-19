@@ -4,10 +4,10 @@ defaults:
   - _self_
 
 experiment:
-  name: moe_wikitext2_alpha_periodic_linear_decay_warmup
+  name: moe_wikitext103_alpha_periodic_linear_decay_warmup
 
 training:
-  dataset_name: wikitext-2-v1
+  dataset_name: wikitext-103-v1
 
 alpha_schedule:
   _target_: schedulers.PeriodicLinearDecayScheduler
@@ -16,7 +16,7 @@ alpha_schedule:
   initial_value: 1.0
   final_value: 0.01
   period_steps: 2000
-
+  start_step: 1000
 
 
 

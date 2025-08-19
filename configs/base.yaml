@@ -14,10 +14,16 @@ training:
   seq_len: 128
   num_workers: 2
   lr: 3e-4
-  log_interval: 500 
+  log_interval: 100  # Изменено на 100 шагов
+  eval_interval: 1000  # Валидация каждые 500 шагов
   total_steps: 30000
   gpu_id: 3 # default id
+  streaming: true  # Использовать потоковый режим для экономии памяти
 
+validation:
+  batch_size: 32
+  num_workers: 2
+  streaming: true  # Использовать потоковый режим для экономии памяти
 
 mlflow:
   tracking_uri: "file:./mlruns"
