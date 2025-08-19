@@ -1,0 +1,18 @@
+# @package _global_
+
+defaults:
+  - /base
+  - _self_
+
+experiment:
+  name: moe_lm1b_alpha_0_4
+
+training:
+  dataset_name: lm1b
+
+alpha_schedule:
+  _target_: schedulers.ConstantScheduler
+  use_warmup: true
+  warmup_steps: null
+  initial_value: 0.4
+  final_value: 0.4

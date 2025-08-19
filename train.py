@@ -1,189 +1,189 @@
-import os
-import pickle
+import hydra
+from omegaconf import DictConfig, OmegaConf
+import mlflow
+import mlflow.pytorch
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from torch.utils.data import DataLoader
-from datasets import load_dataset
-from torch.utils.data.dataset import IterableDataset
 from tqdm import tqdm
-from config import TrainConfig
-from copy import deepcopy
-
-from fmoe.transformer import FMoETransformerMLP
-from fmoe.gates import NaiveGate
-
+from data import get_dataloaders, tokenizer
 from model import TransformerWithMoE
-from data import WikiText103LMIterable, create_wikitext_dataloader, tokenizer
+from gates import BaseGate
+from hydra.utils import instantiate
+import matplotlib.pyplot as plt
+import io
 
-import os
-import datetime
-import torch
-import torch.nn as nn
-from tqdm import tqdm
-from config import TrainConfig, Metrics
 
-vocab_size = tokenizer.vocab_size + 1
+def calc_balance_loss(model, device):
+    balance_loss = torch.tensor(0.0, device=device)
 
-gate_scores = None
-def get_scores(module, inp, out, idx=0):
-    global gate_scores
-    gate_scores = module.raw_forward(inp[0], return_all_scores=True)
-    # print(gate_scores[-1].shape)
-
-def train(
-    model,
-    train_loader,
-    test_loader,
-    optimizer,
-    criterion,
-    config: TrainConfig,
-    device="cuda"
-):
-    """
-    Запускает тренировку модели с учётом параметров из config,
-    накапливает метрики в config.metrics и по завершении
-    сохраняет config вместе с метриками в человекочитаемый JSON.
-    """
-    model.to(device)
-    model.train()
-
-    config.metrics = Metrics()
-    global_iter = 0
-
-    for epoch in range(1, config.epochs + 1):
-        loop = tqdm(enumerate(train_loader, 1), desc=f"Epoch {epoch}/{config.epochs}")
-        for batch_idx, (inputs, targets) in loop:
-            inputs, targets = inputs.to(device), targets.to(device)
-
-            optimizer.zero_grad()
-            outputs = model(inputs)
-
-            target_loss = criterion(
-                outputs.view(-1, outputs.size(-1)),
-                targets.view(-1)
-            )
-
-            balance_loss = 0.0
-            cnt = 0
-            for m in model.modules():
-                if hasattr(m, "gate") and getattr(m.gate, "has_loss", False):
-                    balance_loss += m.gate.get_loss()
-                    cnt += 1
-            if cnt > 0:
-                balance_loss = balance_loss / cnt
-                total_loss = target_loss + config.alpha * balance_loss
+    for m in model.modules():
+        if hasattr(m, "gate") and isinstance(getattr(m, "gate"), BaseGate) and m.gate.has_loss:
+            gl = m.gate.get_loss(clear=True)
+            if isinstance(gl, torch.Tensor):
+                balance_loss = balance_loss + gl.to(device)
             else:
-                total_loss = target_loss
+                raise Exception
+    return balance_loss
 
-            gate_top_k_idx, gate_score, expert_distr = gate_scores
-            seq_len = expert_distr.shape[0]
-            expert_distr_by_device = expert_distr.reshape(seq_len, config.world_size, config.num_experts_per_device)
+def evaluate(model, dataloader, criterion, device, alpha_sched=None, num_layers=None):
+    model.eval()
+    total_loss = 0.0
+    total_ce_loss = 0.0
+    total_tokens = 0
 
-            fashions_on_experts = expert_distr_by_device.max(dim=-1).values
-            norm2_expert_distr_by_device = torch.mean(expert_distr_by_device**2, dim=-1)
-            norm2_fashions_on_experts = torch.mean(fashions_on_experts**2, dim=-1)
+    with torch.no_grad():
+        for batch in dataloader:
+            inp, tgt = batch
+            inp, tgt = inp.to(device), tgt.to(device)
+
+            logits = model(inp)
+            ce_loss = criterion(logits.view(-1, logits.size(-1)), tgt.view(-1))
             
-            loss_dist = torch.mean(norm2_expert_distr_by_device)
-            loss_fashion = torch.mean(norm2_fashions_on_experts)
+            balance_loss = calc_balance_loss(model, device) if alpha_sched else 0.0
+            loss = ce_loss + (alpha_sched.get_value() * balance_loss if alpha_sched else 0.0)
 
-            total_loss = total_loss + config.lambda_2 * loss_dist - config.lambda_1 * loss_fashion
+            total_loss += loss.item() * inp.size(0)
+            total_ce_loss += ce_loss.item() * inp.size(0)
+            total_tokens += inp.size(0)
 
-            total_loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-            optimizer.step()
+    mean_loss = total_loss / total_tokens
+    mean_ce_loss = total_ce_loss / total_tokens
+    ppl = torch.exp(torch.tensor(mean_ce_loss)).item()
+    mean_balance_loss = (balance_loss / num_layers).item() if num_layers else 0.0
 
-            global_iter += 1
+    return mean_loss, mean_ce_loss, mean_balance_loss, ppl
 
-            config.metrics.train_losses.target_loss.append(target_loss.item())
-            config.metrics.train_losses.balance_loss.append(balance_loss.item() if cnt > 0 else 0.0)
-            config.metrics.train_losses.distribution_loss.append(loss_dist.item())
-            config.metrics.train_losses.fashion_loss.append(loss_fashion.item())
 
-            loop.set_postfix({
-                'target': f"{target_loss.item():.4f}",
-                'balance': f"{balance_loss.item() if cnt > 0 else 0.0:.4f}",
-                'dist': f"{loss_dist.item():.4f}",
-                'fashion': f"{loss_fashion.item():.4f}",
-                'total': f"{total_loss.item():.4f}",
-                'alpha': f"{config.alpha:.2f}",
-                'lambda1': f"{config.lambda_1:.2f}",
-                'lambda2': f"{config.lambda_2:.2f}"
-            })
 
-            if global_iter % config.log_interval == 0:
-                timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-                out_name = f"traincfg_alpha{config.alpha:.2f}_{timestamp}.json"
-                config.to_json(out_name)
+@hydra.main(config_path="configs", config_name="base", version_base=None)
+def main(cfg_: DictConfig):
+    cfg = cfg_
+    print(OmegaConf.to_yaml(cfg))
+    mlflow.set_tracking_uri(cfg.mlflow.tracking_uri)
+    mlflow.set_experiment(cfg.mlflow.experiment_name)
+    with mlflow.start_run(run_name=cfg.experiment.name):
+        # Log full resolved Hydra config as an artifact
+        resolved_cfg_yaml = OmegaConf.to_yaml(cfg)
+        mlflow.log_text(resolved_cfg_yaml, artifact_file="hydra_config.yaml")
+        mlflow.log_params(OmegaConf.to_container(cfg, resolve=True))
 
-                model.eval()
-                val_losses = []
-                with torch.no_grad():
-                    for t_in, t_tgt in test_loader:
-                        t_in, t_tgt = t_in.to(device), t_tgt.to(device)
-                        t_out = model(t_in)
-                        v_loss = criterion(
-                            t_out.view(-1, t_out.size(-1)),
-                            t_tgt.view(-1)
-                        )
-                        val_losses.append(v_loss.item())
-                avg_val = sum(val_losses) / len(val_losses)
-                config.metrics.val_losses.target_loss.append(avg_val)
+        dataloader, val_dataloader, _ = get_dataloaders(
+            cfg.training.dataset_name,
+            seq_len=cfg.training.seq_len, 
+            batch_size=cfg.training.batch_size, 
+            num_workers=cfg.training.num_workers
+        )
 
-                out_name = f"traincfg_alpha{config.alpha:.2f}_{timestamp}.json"
-                config.to_json(out_name)
+        alpha_sched = instantiate(cfg.alpha_schedule, total_steps=cfg.training.total_steps)
 
-                tqdm.write(f"[Iter {global_iter}] Val loss: {avg_val:.4f}")
-                model.train()
-
-        ckpt_name = f"ckpt_alpha{config.alpha:.2f}_epoch{epoch}.pt"
-        torch.save({
-            "epoch": epoch,
-            "model_state": model.state_dict(),
-            "optimizer_state": optimizer.state_dict(),
-        }, ckpt_name)
-        print(f"🔖 Saved checkpoint: {ckpt_name}")
-
-    timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-    out_name = f"traincfg_alpha{config.alpha:.2f}_{timestamp}.json"
-    config.to_json(out_name)
-    print(f"✅ Training finished. Config with metrics saved to {out_name}")
-
-def run_with_alphas(alphas, config: TrainConfig):
-    train_loader = create_wikitext_dataloader(config.batch_size, config.seq_len, split="train")
-    test_loader  = create_wikitext_dataloader(config.batch_size, config.seq_len, split="validation")
-    
-    for alpha in alphas:
-        print(f"\n=== Training with alpha={alpha} ===\n")
-        config = deepcopy(config)
-        config.alpha = alpha
+        vocab_size = len(tokenizer)
+        device = f'cuda:{cfg.training.gpu_id}'
         model = TransformerWithMoE(
-            vocab_size,
-            config.d_model,
-            config.num_layers,
-            config.num_experts_per_device,
-            config.world_size,
-            config.top_k,
-            padding_idx=tokenizer.pad_token_id
-        )
+            vocab_size=vocab_size,
+            d_model=cfg.model.d_model,
+            num_layers=cfg.model.num_layers,
+            num_experts=cfg.model.num_experts,
+            top_k=cfg.model.top_k,
+            padding_idx=cfg.model.padding_idx,
+        ).to(device)
 
-        for i, layer in enumerate(model.layers):
-            layer.moe.gate.register_forward_hook(get_scores)
+        criterion = nn.CrossEntropyLoss(ignore_index=cfg.model.padding_idx)
+        optimizer = optim.AdamW(model.parameters(), lr=cfg.training.lr)
 
-        optimizer = optim.Adam(model.parameters(), lr=4e-4)
-        criterion = nn.CrossEntropyLoss(ignore_index=tokenizer.pad_token_id)
+        global_step = 0
+        total_steps = cfg.training.total_steps
 
-        train(
-            model,
-            train_loader,
-            test_loader,
-            optimizer,
-            criterion,
-            config=config,
-            device='cuda'
-        )
+        pbar = tqdm(total=total_steps, desc="Training", unit="step")
+
+        model.train()
+        while global_step < total_steps:
+            for batch in dataloader:
+                inp, tgt = batch
+                # quick sanity check (debugging): убедиться, что id < vocab_size
+                if inp.max().item() >= vocab_size or tgt.max().item() >= vocab_size:
+                    raise ValueError(f"Token id exceeds vocab size: max(inp)={inp.max().item()}, vocab_size={vocab_size}")
+
+                inp, tgt = inp.to(device), tgt.to(device)
+
+                optimizer.zero_grad()
+                logits = model(inp)
+                ce_loss = criterion(logits.view(-1, logits.size(-1)), tgt.view(-1))
+                
+                balance_loss = calc_balance_loss(model, device)    
+                loss = ce_loss + alpha_sched.get_value() * balance_loss
+
+                loss.backward()
+                optimizer.step()
+
+                if global_step % 50 == 0:
+                    mean_balance_loss = balance_loss / cfg.model.num_layers
+                    ppl = torch.exp(ce_loss).item()
+                    mlflow.log_metric("loss", loss.item(), step=global_step)
+                    mlflow.log_metric("ce_loss", ce_loss.item(), step=global_step)
+                    mlflow.log_metric("mean_balance_loss", mean_balance_loss.item(), step=global_step)
+                    mlflow.log_metric("perplexity", ppl, step=global_step)
+                    mlflow.log_metric("alpha_sched", alpha_sched.get_value(), step=global_step)
+
+                    with torch.no_grad():
+                        dist_payload = {"step": int(global_step), "layers": {}}
+                        for layer_idx, layer in enumerate(model.layers):
+                            if hasattr(layer, "moe") and hasattr(layer.moe, "gate"):
+                                gate = layer.moe.gate
+
+                                # print(gate.has_distributions)
+                                if getattr(gate, "has_distributions", False) and gate.has_distributions:
+                                    probs, loads = gate.get_distributions(clear=True)
+                                    # print(probs, loads)
+                                    dist_payload["layers"][str(layer_idx)] = {
+                                        "probs": [float(v) for v in probs.view(-1).tolist()],
+                                        "loads": [float(v) for v in loads.view(-1).tolist()],
+                                    }
+
+                                    if global_step % 500 == 0:
+                                        fig, axes = plt.subplots(1, 2, figsize=(10, 4))
+
+                                        probs_values = probs.numpy()
+                                        bins_probs = range(len(probs_values))
+                                        axes[0].bar(bins_probs, probs_values, color='tab:blue', alpha=0.8)
+                                        axes[0].set_title(f"Layer {layer_idx} probs")
+                                        axes[0].set_xlabel("bin")
+                                        axes[0].set_ylabel("count")
+                                        loads_values = loads.numpy()
+                                        bins_loads = range(len(loads_values))
+                                        axes[1].bar(bins_loads, loads_values, color='tab:orange', alpha=0.8)
+                                        axes[1].set_title(f"Layer {layer_idx} loads")
+                                        axes[1].set_xlabel("bin")
+                                        axes[1].set_ylabel("count")
+
+                                        plt.tight_layout()
+                                        mlflow.log_figure(fig, f"gate_histograms/step_{global_step}_layer_{layer_idx}.png")
+
+                        if global_step % cfg.training.log_interval == 0 and len(dist_payload["layers"]) > 0:
+                            try:
+                                mlflow.log_dict(dist_payload, artifact_file=f"gate_distributions/step_{global_step}.json")
+                            except Exception:
+                                pass
+
+                if global_step % cfg.training.log_interval == 0:
+                    val_loss, val_ce_loss, val_mean_balance_loss, val_ppl = evaluate(
+                        model, val_dataloader, criterion, device, alpha_sched, cfg.model.num_layers
+                    )
+                    mlflow.log_metric("val_loss", val_loss, step=global_step)
+                    mlflow.log_metric("val_ce_loss", val_ce_loss, step=global_step)
+                    mlflow.log_metric("val_mean_balance_loss", val_mean_balance_loss, step=global_step)
+                    mlflow.log_metric("val_perplexity", val_ppl, step=global_step)
+                    model.train()
+                    pbar.set_postfix(loss=loss.item(), ce=ce_loss.item(), mean_balance=mean_balance_loss.item(), ppl=ppl)
+
+                global_step += 1
+                alpha_sched.step()
+                pbar.update(1)
+                if global_step >= total_steps:
+                    break
+
+            mlflow.pytorch.log_model(model, artifact_path="model")
 
 
-config = TrainConfig()
-alphas = [0.0, 0.2, 0.5, 0.8, 1.0]
-run_with_alphas(alphas, config)
+if __name__ == "__main__":
+    main()

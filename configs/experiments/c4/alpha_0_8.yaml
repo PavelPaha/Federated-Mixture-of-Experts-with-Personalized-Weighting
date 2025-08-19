@@ -1,0 +1,18 @@
+# @package _global_
+
+defaults:
+  - /base
+  - _self_
+
+experiment:
+  name: moe_c4_alpha_0_8
+
+training:
+  dataset_name: c4
+
+alpha_schedule:
+  _target_: schedulers.ConstantScheduler
+  use_warmup: true
+  warmup_steps: null
+  initial_value: 0.8
+  final_value: 0.8

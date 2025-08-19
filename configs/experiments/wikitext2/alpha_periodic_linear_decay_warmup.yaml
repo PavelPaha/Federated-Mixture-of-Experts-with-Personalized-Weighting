@@ -1,0 +1,23 @@
+# @package _global_
+defaults:
+  - /base
+  - _self_
+
+experiment:
+  name: moe_wikitext2_alpha_periodic_linear_decay_warmup
+
+training:
+  dataset_name: wikitext-2-v1
+
+alpha_schedule:
+  _target_: schedulers.PeriodicLinearDecayScheduler
+  use_warmup: true
+  warmup_steps: 1000
+  initial_value: 1.0
+  final_value: 0.01
+  period_steps: 2000
+
+
+
+
+

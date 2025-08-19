@@ -1,0 +1,18 @@
+# @package _global_
+
+defaults:
+  - /base
+  - _self_
+
+experiment:
+  name: moe_ptb_alpha_1_0
+
+training:
+  dataset_name: ptb
+
+alpha_schedule:
+  _target_: schedulers.ConstantScheduler
+  use_warmup: true
+  warmup_steps: null
+  initial_value: 1.0
+  final_value: 1.0

@@ -1,0 +1,18 @@
+# @package _global_
+
+defaults:
+  - /base
+  - _self_
+
+experiment:
+  name: moe_openwebtext_alpha_0_6
+
+training:
+  dataset_name: openwebtext
+
+alpha_schedule:
+  _target_: schedulers.ConstantScheduler
+  use_warmup: true
+  warmup_steps: null
+  initial_value: 0.6
+  final_value: 0.6

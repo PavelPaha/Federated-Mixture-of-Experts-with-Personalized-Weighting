@@ -1,0 +1,18 @@
+# @package _global_
+
+defaults:
+  - /base
+  - _self_
+
+experiment:
+  name: moe_wikitext2_alpha_0_0
+
+training:
+  dataset_name: wikitext-2-v1
+
+alpha_schedule:
+  _target_: schedulers.ConstantScheduler
+  use_warmup: true
+  warmup_steps: null
+  initial_value: 0.0
+  final_value: 0.0

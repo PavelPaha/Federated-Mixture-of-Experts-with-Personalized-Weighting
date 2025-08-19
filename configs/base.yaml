@@ -1,0 +1,24 @@
+experiment:
+  name: "moe_wikitext"
+
+model:
+  d_model: 256
+  num_layers: 4
+  num_experts: 10
+  top_k: 2
+  padding_idx: 0
+
+training:
+  dataset_name: "wikitext-2-v1"
+  batch_size: 32
+  seq_len: 128
+  num_workers: 2
+  lr: 3e-4
+  log_interval: 500 
+  total_steps: 30000
+  gpu_id: 3 # default id
+
+
+mlflow:
+  tracking_uri: "file:./mlruns"
+  experiment_name: "wikitext103_moe"

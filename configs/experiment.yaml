@@ -1,0 +1,8 @@
+defaults:
+  - base
+  - override dataset_name: wikitext-2-v1
+  - override alpha_schedule: constant_0.2
+
+training:
+  dataset_name: ${dataset_name}
+
