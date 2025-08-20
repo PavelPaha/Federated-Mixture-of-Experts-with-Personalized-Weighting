@@ -13,13 +13,14 @@ training:
   batch_size: 32
   seq_len: 256
   num_workers: 2
-  lr: 3e-4
+  lr: 1e-4
+  weight_decay: 0.01
   log_interval: 100  # Изменено на 100 шагов
   eval_interval: 1000  # Валидация каждые 500 шагов
   total_steps: 30000
   gpu_id: 3 # default id
   streaming: true  # Использовать потоковый режим для экономии памяти
-  
+
   # Checkpoint settings
   checkpoint_interval: 5000  # Save checkpoint every N steps
   checkpoint_dir: "./checkpoints"  # Directory to save checkpoints
@@ -27,10 +28,17 @@ training:
   checkpoint_path: null  # Path to checkpoint file (when resuming)
   additional_steps: null  # Additional steps to train when resuming
 
+lr_scheduler:
+  _target_: schedulers.CosineAnnealingWarmupScheduler
+  warmup_steps: 1000
+  total_steps: ${training.total_steps}
+  min_lr: 1e-6
+
+
 validation:
   batch_size: 32
   num_workers: 2
-  streaming: true  # Использовать потоковый режим для экономии памяти
+  streaming: false  # Использовать потоковый режим для экономии памяти
 
 mlflow:
   tracking_uri: "file:./mlruns"

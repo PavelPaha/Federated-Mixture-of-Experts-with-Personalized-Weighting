@@ -19,7 +19,7 @@ logging.basicConfig(
 )
 
 # Конфигурация GPU
-AVAILABLE_GPUS = [5, 6, 7]
+AVAILABLE_GPUS = [2, 3, 5, 6, 7]
 INCLUDED_DATASETS = ["wikitext2"]
 
 def get_all_experiments():

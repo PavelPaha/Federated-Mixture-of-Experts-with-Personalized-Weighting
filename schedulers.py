@@ -99,8 +99,7 @@ class PeriodicLinearDecayScheduler(AlphaScheduler):
         period_progress = steps_in_current_period / self.period_steps
         current_period_value = self.initial_value + (self.final_value - self.initial_value) * period_progress
         
-        return current_period_value
-
+        return current_period_value * (0.9 ** current_period)
 
 class SmoothResumeScheduler(AlphaScheduler):
     """
@@ -136,3 +135,62 @@ class SmoothResumeScheduler(AlphaScheduler):
         progress = steps_since_resume / self.remaining_steps
         
         return self.resume_alpha_value + (self.final_value - self.resume_alpha_value) * progress
+
+
+class CosineAnnealingWarmupScheduler:
+    """
+    Learning rate scheduler with warmup and cosine annealing.
+    Compatible with PyTorch's optimizer interface.
+    """
+    def __init__(self, optimizer, warmup_steps, total_steps, min_lr=1e-6, last_epoch=-1):
+        self.optimizer = optimizer
+        self.warmup_steps = warmup_steps
+        self.total_steps = total_steps
+        self.min_lr = min_lr
+        self.last_epoch = last_epoch
+        self.base_lr = optimizer.param_groups[0]['lr']
+        
+        # Initialize step counter
+        self.step_num = 0
+        
+    def step(self):
+        """Update learning rate and step counter"""
+        self.step_num += 1
+        lr = self.get_lr()
+        
+        for param_group in self.optimizer.param_groups:
+            param_group['lr'] = lr
+            
+        return lr
+    
+    def get_lr(self):
+        """Get current learning rate"""
+        if self.step_num <= self.warmup_steps:
+            # Linear warmup
+            return self.base_lr * self.step_num / self.warmup_steps
+        else:
+            # Cosine annealing
+            progress = (self.step_num - self.warmup_steps) / (self.total_steps - self.warmup_steps)
+            progress = min(1.0, max(0.0, progress))  # Clamp to [0, 1]
+            
+            # Cosine decay from base_lr to min_lr
+            cos_decay = 0.5 * (1 + torch.cos(torch.tensor(progress * 3.14159265)))
+            return self.min_lr + (self.base_lr - self.min_lr) * cos_decay
+    
+    def state_dict(self):
+        """Return state dict for checkpointing"""
+        return {
+            'step_num': self.step_num,
+            'base_lr': self.base_lr,
+            'warmup_steps': self.warmup_steps,
+            'total_steps': self.total_steps,
+            'min_lr': self.min_lr
+        }
+    
+    def load_state_dict(self, state_dict):
+        """Load state dict from checkpoint"""
+        self.step_num = state_dict['step_num']
+        self.base_lr = state_dict['base_lr']
+        self.warmup_steps = state_dict['warmup_steps']
+        self.total_steps = state_dict['total_steps']
+        self.min_lr = state_dict['min_lr']

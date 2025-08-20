@@ -63,7 +63,7 @@ class MoELayer(nn.Module):
 class TransformerLayer(nn.Module):
     def __init__(self, d_model, num_experts, top_k):
         super().__init__()
-        self.self_attn = nn.MultiheadAttention(d_model, num_heads=8, batch_first=True)
+        self.self_attn = nn.MultiheadAttention(d_model, num_heads=8, batch_first=True, dropout=0.1)
         self.norm1 = nn.LayerNorm(d_model)
         self.moe = MoELayer(d_model, num_experts, top_k)
         self.norm2 = nn.LayerNorm(d_model)

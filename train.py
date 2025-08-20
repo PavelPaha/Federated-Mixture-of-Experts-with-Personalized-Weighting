@@ -193,8 +193,14 @@ def main(cfg: DictConfig):
             padding_idx=cfg.model.padding_idx,
         ).to(device)
 
-        criterion = nn.CrossEntropyLoss(ignore_index=cfg.model.padding_idx)
-        optimizer = optim.AdamW(model.parameters(), lr=cfg.training.lr)
+        criterion = nn.CrossEntropyLoss(ignore_index=cfg.model.padding_idx, label_smoothing=0.1)
+        optimizer = optim.AdamW(model.parameters(), lr=cfg.training.lr, weight_decay=cfg.training.weight_decay)
+
+        # Initialize learning rate scheduler
+        if hasattr(cfg, 'lr_scheduler'):
+            lr_scheduler = instantiate(cfg.lr_scheduler, optimizer=optimizer)
+        else:
+            lr_scheduler = None
 
         global_step = 0
         total_steps = cfg.training.total_steps
@@ -263,6 +269,10 @@ def main(cfg: DictConfig):
                 loss.backward()
                 optimizer.step()
 
+                # Step the learning rate scheduler if it exists
+                if lr_scheduler is not None:
+                    lr_scheduler.step()
+
                 # Вычисляем mean_balance_loss на каждом шаге для tqdm
                 mean_balance_loss = balance_loss / cfg.model.num_layers
 
@@ -283,6 +293,10 @@ def main(cfg: DictConfig):
                         mlflow.log_metric("train_mean_balance_loss", balance_loss_val, step=step)
                         mlflow.log_metric("train_perplexity", torch.exp(torch.tensor(ce_loss_val)).item(), step=step)
                     mlflow.log_metric("alpha_sched", alpha_sched.get_value(), step=global_step)
+                    
+                    # Log current learning rate
+                    current_lr = optimizer.param_groups[0]['lr']
+                    mlflow.log_metric("learning_rate", current_lr, step=global_step)
                     
                     # Очищаем списки батч метрик
                     batch_losses.clear()
@@ -305,7 +319,7 @@ def main(cfg: DictConfig):
 
                 # print('12323')
                 # Валидация каждые 1000 шагов
-                if global_step % cfg.training.eval_interval == 0:
+                if global_step and global_step % cfg.training.eval_interval == 0:
                     val_ce_loss, val_balance_loss = evaluate_model(model, val_dataloader, criterion, device)
                     val_ppl = torch.exp(torch.tensor(val_ce_loss)).item()
                     mean_val_balance_loss = val_balance_loss / cfg.model.num_layers
