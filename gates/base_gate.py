@@ -27,35 +27,28 @@ class BaseGate(nn.Module):
             self.loss = None
         return loss
 
-    def save_gate_output(self, gate_scores):
+    def save_gate_output(self, expert_distribution):
         """
-        Сохраняет выход гейта для последующего логирования
+        Сохраняет только распределение по экспертам для последующего логирования
         Args:
-            gate_scores: оригинальные softmax вероятности для всех экспертов [batch_size, tot_expert]
+            expert_distribution: тензор формы [tot_expert] — средние вероятности по экспертам
         """
-        # Сохраняем как CPU тензор для логирования
-        self.last_gate_output = gate_scores.detach().cpu()
+        # Сохраняем как 1D CPU-тензор
+        self.last_gate_output = expert_distribution.detach().cpu().view(-1)
 
     def get_gate_distribution(self, clear=True):
         """
-        Возвращает распределение использования экспертов
-        Returns:
-            expert_usage: средняя вероятность использования каждого эксперта
-            gate_weights: стандартное отклонение весов для каждого эксперта
+        Возвращает сохранённое распределение использования экспертов [tot_expert]
         """
         if self.last_gate_output is None:
             return None, None
-        
-        # Вычисляем среднюю вероятность для каждого эксперта по батчу
-        expert_usage = self.last_gate_output.mean(dim=0)  # [tot_expert]
-        
-        # Вычисляем стандартное отклонение весов для каждого эксперта по батчу
-        gate_weights = self.last_gate_output.std(dim=0)  # [tot_expert]
-        
+
+        expert_usage = self.last_gate_output
+
         if clear:
             self.last_gate_output = None
-            
-        return expert_usage, gate_weights
+
+        return expert_usage, None
 
     @property
     def has_loss(self):

@@ -43,6 +43,7 @@ class GShardGate(BaseGate):
 
       # сохранить
       self.set_loss(balance_loss)
+      # Сохраняем только распределение по экспертам [E]
       self.save_gate_output(mean_gates)
 
       return top_scores, top_indices

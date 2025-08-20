@@ -127,29 +127,20 @@ def log_gate_distributions(model, step, mlflow):
         if hasattr(layer, 'moe') and hasattr(layer.moe, 'gate'):
             gate = layer.moe.gate
             if hasattr(gate, 'get_gate_distribution'):
-                expert_usage, gate_weights = gate.get_gate_distribution(clear=True)
-                if expert_usage is not None and gate_weights is not None:
-                    # Создаем график распределения
-                    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 5))
-                    
-                    # График количества использований экспертов
-                    expert_indices = range(len(expert_usage))
+                expert_usage, _ = gate.get_gate_distribution(clear=True)
+                if expert_usage is not None:
+                    # Приводим к 1D вектору на случай 0-D (скаляра)
+                    if expert_usage.dim() == 0:
+                        expert_usage = expert_usage.unsqueeze(0)
+                    # Создаем график распределения только среднего использования экспертов
+                    fig, ax1 = plt.subplots(1, 1, figsize=(6, 5))
+                    expert_indices = range(int(expert_usage.numel()))
                     ax1.bar(expert_indices, expert_usage.numpy(), color='skyblue', alpha=0.7)
                     ax1.set_title(f'Layer {layer_idx}: Expert Usage Probability (Mean)')
                     ax1.set_xlabel('Expert Index')
                     ax1.set_ylabel('Mean Probability')
                     ax1.grid(True, alpha=0.3)
-                    
-                    # График средних весов экспертов
-                    ax2.bar(expert_indices, gate_weights.numpy(), color='lightcoral', alpha=0.7)
-                    ax2.set_title(f'Layer {layer_idx}: Expert Weight Standard Deviation')
-                    ax2.set_xlabel('Expert Index')
-                    ax2.set_ylabel('Standard Deviation')
-                    ax2.grid(True, alpha=0.3)
-                    
                     plt.tight_layout()
-                    
-                    # Логируем график в MLflow
                     mlflow.log_figure(fig, f"gate_distributions/layer_{layer_idx}_step_{step}.png")                
                     plt.close(fig)
 
