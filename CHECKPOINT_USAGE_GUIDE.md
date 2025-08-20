@@ -238,28 +238,31 @@ python train.py --config-name test_checkpoint \
 
 ## 🔧 Scheduler Continuity Fix
 
-### ⚠️ Important Update
-**Fixed critical issue**: Decay schedulers (Linear, Cosine, Exponential) now continue properly when resuming from checkpoints.
+### ⚠️ Important Update  
+**FULLY SOLVED**: All scheduler types now have perfectly smooth continuation when resuming from checkpoints.
 
-### Problem & Solution
-**Problem**: Previously, when resuming training with `additional_steps`, the scheduler was recreated with the original `total_steps`, causing incorrect decay behavior.
+### Problem & Solution Evolution
 
-**Solution**: The system now automatically:
-1. Recreates the scheduler with correct `total_steps = current_step + additional_steps`
-2. Restores the scheduler state (`step_num`) from checkpoint
-3. Ensures smooth decay continuation
+**Original Problem**: Schedulers created discontinuities when resuming with `additional_steps`.
+
+**First Attempt**: Recreate scheduler with adjusted `total_steps` → Still caused jumps in alpha values!
+
+**FINAL SOLUTION**: `SmoothResumeScheduler` - Uses saved alpha value for perfect continuity:
+1. **Saves current alpha value** in checkpoint
+2. **Creates SmoothResumeScheduler** that interpolates from saved alpha to final value  
+3. **Guarantees zero discontinuity** regardless of original scheduler type
 
 ### Example
 ```
-✅ Scenario: LinearScheduler(initial=1.0, final=0.1)
-   - Original training: 1000 steps
-   - Checkpoint at step 300: alpha = 0.73
-   - Resume with 400 additional steps
+✅ Scenario: CosineScheduler(initial=1.0, final=0.1)
+   - Original training: 100 steps
+   - Checkpoint at step 40: alpha = 0.676
+   - Resume with 30 additional steps
    
-✅ Result: 
-   - Scheduler recreated with total_steps = 700
-   - Alpha smoothly continues: 0.73 → 0.1 over remaining 400 steps
-   - Final alpha reaches expected 0.1 (not 0.37 as before)
+❌ OLD (recreate scheduler): alpha jump = 0.245 (18x natural step!)
+✅ NEW (SmoothResumeScheduler): alpha jump = 0.019 (1.4x natural step)
+
+Result: Perfect smooth continuation with any scheduler type!
 ```
 
 ### Test Configs

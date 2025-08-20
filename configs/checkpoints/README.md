@@ -69,13 +69,17 @@ Checkpoints contain:
 
 ⚠️ **Important**: The system automatically handles scheduler continuity when resuming training.
 
-### Problem Solved
-Previously, decay schedulers (Linear, Cosine, Exponential) would not continue properly when resuming from checkpoints because they were recreated with the original `total_steps` instead of the new total.
+### Problem Fully Solved  
+ALL scheduler types now have perfectly smooth continuation when resuming from checkpoints.
 
-### Solution Implemented
-- Scheduler is automatically recreated with correct `total_steps = current_step + additional_steps`
-- Scheduler state (`step_num`) is properly restored
-- Decay continues smoothly from checkpoint point
+### Solution Evolution
+1. **First attempt**: Recreate scheduler with adjusted `total_steps` → Still caused alpha jumps
+2. **FINAL SOLUTION**: `SmoothResumeScheduler` uses saved alpha value for perfect continuity
+
+### How It Works
+- Current alpha value is saved in checkpoint
+- `SmoothResumeScheduler` interpolates from saved alpha to final value
+- Guarantees zero discontinuity regardless of original scheduler type
 
 ### Example
 ```

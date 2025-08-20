@@ -37,6 +37,7 @@ def save_checkpoint(model, optimizer, alpha_sched, global_step, cfg, checkpoint_
             'initial_value': getattr(alpha_sched, 'initial_value', None),
             'final_value': getattr(alpha_sched, 'final_value', None),
         },
+        'alpha_value': alpha_sched.get_value(),  # ВАЖНО: сохраняем текущее значение alpha
         'global_step': global_step,
         'config': OmegaConf.to_container(cfg, resolve=True),
         'model_config': {
@@ -222,10 +223,17 @@ def main(cfg: DictConfig):
                 total_steps = global_step + cfg.training.additional_steps
                 print(f"Training for {cfg.training.additional_steps} additional steps (total: {total_steps})")
             
-            # IMPORTANT: Recreate scheduler with correct total_steps for proper decay continuation
-            print(f"Recreating scheduler with total_steps={total_steps} for proper continuation")
-            alpha_sched = instantiate(cfg.alpha_schedule, total_steps=total_steps)
-            alpha_sched.step_num = temp_alpha_sched.step_num  # Restore scheduler state
+            # IMPORTANT: Use SmoothResumeScheduler for truly smooth continuation
+            saved_alpha = temp_alpha_sched.get_value()  # Get current alpha value from temp scheduler
+            print(f"Creating SmoothResumeScheduler for smooth continuation from alpha={saved_alpha:.6f}")
+            
+            from schedulers import SmoothResumeScheduler
+            alpha_sched = SmoothResumeScheduler(
+                total_steps=total_steps,
+                current_step=global_step,
+                resume_alpha_value=saved_alpha,
+                final_value=getattr(temp_alpha_sched, 'final_value', 0.1)
+            )
         else:
             # Normal training - create scheduler with original total_steps
             alpha_sched = instantiate(cfg.alpha_schedule, total_steps=total_steps)
