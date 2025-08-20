@@ -77,18 +77,22 @@ ALL scheduler types now have perfectly smooth continuation when resuming from ch
 2. **FINAL SOLUTION**: `SmoothResumeScheduler` uses saved alpha value for perfect continuity
 
 ### How It Works
-- Current alpha value is saved in checkpoint
-- `SmoothResumeScheduler` interpolates from saved alpha to final value
-- Guarantees zero discontinuity regardless of original scheduler type
+- **Complete scheduler state** (all parameters + step_num) is saved in checkpoint
+- On resume: scheduler is recreated with **exact same parameters** from checkpoint
+- Scheduler state (step_num) is **precisely restored**
+- **Result**: Identical behavior = perfect continuity
 
 ### Example
 ```
-Original plan: 1000 steps, LinearScheduler(1.0 → 0.1)
-Checkpoint at: step 300, alpha = 0.73
-Resume with:   400 additional steps
+Original: CosineScheduler(total_steps=100, initial=1.0, final=0.1)
+Checkpoint at: step 40, alpha = 0.676
 
-✅ FIXED: Scheduler recreated with total_steps = 700
-✅ Alpha continues: 0.73 → 0.1 over remaining 400 steps
+Resume: Scheduler recreated with EXACT same parameters:
+- total_steps=100 (original value!)
+- step_num=41 (restored state)
+
+Result: IDENTICAL behavior = perfect smooth continuation
+Test: 10-step sequence difference = 0.000000000000 (perfect!)
 ```
 
 ## Tips

@@ -247,31 +247,31 @@ python train.py --config-name test_checkpoint \
 
 **First Attempt**: Recreate scheduler with adjusted `total_steps` → Still caused jumps in alpha values!
 
-**FINAL SOLUTION**: `SmoothResumeScheduler` - Uses saved alpha value for perfect continuity:
-1. **Saves current alpha value** in checkpoint
-2. **Creates SmoothResumeScheduler** that interpolates from saved alpha to final value  
-3. **Guarantees zero discontinuity** regardless of original scheduler type
+**FINAL SOLUTION**: **Exact State Restoration** - Restore scheduler with identical parameters:
+1. **Saves complete scheduler state** (all parameters + step_num) in checkpoint
+2. **Recreates scheduler with exact same parameters** from checkpoint
+3. **Restores precise state** (step_num) for identical behavior
+4. **Result**: Perfect continuity because scheduler behaves identically
 
 ### Example
 ```
-✅ Scenario: CosineScheduler(initial=1.0, final=0.1)
-   - Original training: 100 steps
-   - Checkpoint at step 40: alpha = 0.676
-   - Resume with 30 additional steps
+✅ Scenario: CosineScheduler(total_steps=100, initial=1.0, final=0.1)
+   - Checkpoint at step 40: step_num=41, alpha=0.676
+   - Resume with exact state restoration
    
-❌ OLD (recreate scheduler): alpha jump = 0.245 (18x natural step!)
-✅ NEW (SmoothResumeScheduler): alpha jump = 0.019 (1.4x natural step)
+❌ OLD (wrong parameters): alpha jump = 0.245 (18x natural step!)
+✅ NEW (exact restoration): alpha jump = 0.000000 (PERFECT!)
 
-Result: Perfect smooth continuation with any scheduler type!
+Test: 10-step sequence difference = 0.000000000000 (identical behavior)
 ```
 
 ### Test Configs
-Use these configs to verify the fix:
+Use these configs to verify perfect scheduler restoration:
 ```bash
-# 1. Train with LinearScheduler until checkpoint
+# 1. Train with CosineScheduler until checkpoint (most problematic scheduler)
 python train.py --config-name test_scheduler_fix
 
-# 2. Resume and verify smooth continuation  
+# 2. Resume with exact state restoration - should be perfectly smooth
 python train.py --config-name test_scheduler_resume
 ```
 

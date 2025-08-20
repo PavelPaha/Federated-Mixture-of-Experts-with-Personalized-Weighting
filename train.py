@@ -26,18 +26,23 @@ def save_checkpoint(model, optimizer, alpha_sched, global_step, cfg, checkpoint_
     step_suffix = f"_step_{step}" if step is not None else ""
     checkpoint_path = os.path.join(checkpoint_dir, f"checkpoint{step_suffix}.pt")
     
+    # Сохраняем полное состояние шедулера для точного восстановления
+    scheduler_state = {
+        'step_num': alpha_sched.step_num,
+        'total_steps': alpha_sched.total_steps,
+        'use_warmup': getattr(alpha_sched, 'use_warmup', False),
+        'warmup_steps': getattr(alpha_sched, 'warmup_steps', 0),
+        'initial_value': getattr(alpha_sched, 'initial_value', None),
+        'final_value': getattr(alpha_sched, 'final_value', None),
+        # Дополнительные параметры для специальных шедулеров
+        'period_steps': getattr(alpha_sched, 'period_steps', None),
+    }
+    
     checkpoint = {
         'model_state_dict': model.state_dict(),
         'optimizer_state_dict': optimizer.state_dict(),
-        'scheduler_step': alpha_sched.step_num,
-        'scheduler_config': {
-            'total_steps': alpha_sched.total_steps,
-            'use_warmup': getattr(alpha_sched, 'use_warmup', False),
-            'warmup_steps': getattr(alpha_sched, 'warmup_steps', 0),
-            'initial_value': getattr(alpha_sched, 'initial_value', None),
-            'final_value': getattr(alpha_sched, 'final_value', None),
-        },
-        'alpha_value': alpha_sched.get_value(),  # ВАЖНО: сохраняем текущее значение alpha
+        'scheduler_state': scheduler_state,
+        'alpha_schedule_config': OmegaConf.to_container(cfg.alpha_schedule, resolve=True),  # Полная конфигурация
         'global_step': global_step,
         'config': OmegaConf.to_container(cfg, resolve=True),
         'model_config': {
@@ -59,16 +64,19 @@ def save_checkpoint(model, optimizer, alpha_sched, global_step, cfg, checkpoint_
     return checkpoint_path
 
 
-def load_checkpoint(checkpoint_path, model, optimizer, alpha_sched, device):
+def load_checkpoint(checkpoint_path, model, optimizer, device):
     """Load training checkpoint and restore model weights, optimizer state, and training metadata"""
     checkpoint = torch.load(checkpoint_path, map_location=device)
     
     model.load_state_dict(checkpoint['model_state_dict'])
     optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
-    alpha_sched.step_num = checkpoint['scheduler_step']
     global_step = checkpoint['global_step']
     
-    return global_step, checkpoint.get('config', {})
+    # Возвращаем состояние шедулера и его конфигурацию для точного восстановления
+    scheduler_state = checkpoint.get('scheduler_state', {})
+    alpha_schedule_config = checkpoint.get('alpha_schedule_config', {})
+    
+    return global_step, scheduler_state, alpha_schedule_config, checkpoint.get('config', {})
 
 
 def calc_balance_loss(model, device):
@@ -213,9 +221,8 @@ def main(cfg: DictConfig):
             checkpoint_path = cfg.training.checkpoint_path
             print(f"Loading checkpoint from: {checkpoint_path}")
             
-            # Create temporary scheduler to load checkpoint
-            temp_alpha_sched = instantiate(cfg.alpha_schedule, total_steps=cfg.training.total_steps)
-            global_step, loaded_config = load_checkpoint(checkpoint_path, model, optimizer, temp_alpha_sched, device)
+            global_step, scheduler_state, alpha_schedule_config, loaded_config = load_checkpoint(
+                checkpoint_path, model, optimizer, device)
             print(f"Resumed training from step {global_step}")
             
             # If additional_steps is specified, update total_steps
@@ -223,17 +230,18 @@ def main(cfg: DictConfig):
                 total_steps = global_step + cfg.training.additional_steps
                 print(f"Training for {cfg.training.additional_steps} additional steps (total: {total_steps})")
             
-            # IMPORTANT: Use SmoothResumeScheduler for truly smooth continuation
-            saved_alpha = temp_alpha_sched.get_value()  # Get current alpha value from temp scheduler
-            print(f"Creating SmoothResumeScheduler for smooth continuation from alpha={saved_alpha:.6f}")
+            # ВАЖНО: Восстанавливаем шедулер с ОРИГИНАЛЬНЫМИ параметрами из чекпоинта
+            print(f"Restoring scheduler with original parameters from checkpoint")
+            if alpha_schedule_config:
+                # Используем сохраненную конфигурацию шедулера
+                alpha_sched = instantiate(alpha_schedule_config)
+            else:
+                # Fallback: используем текущую конфигурацию  
+                alpha_sched = instantiate(cfg.alpha_schedule, total_steps=scheduler_state.get('total_steps', total_steps))
             
-            from schedulers import SmoothResumeScheduler
-            alpha_sched = SmoothResumeScheduler(
-                total_steps=total_steps,
-                current_step=global_step,
-                resume_alpha_value=saved_alpha,
-                final_value=getattr(temp_alpha_sched, 'final_value', 0.1)
-            )
+            # Восстанавливаем состояние шедулера
+            alpha_sched.step_num = scheduler_state.get('step_num', 0)
+            print(f"Restored scheduler: step_num={alpha_sched.step_num}, total_steps={alpha_sched.total_steps}")
         else:
             # Normal training - create scheduler with original total_steps
             alpha_sched = instantiate(cfg.alpha_schedule, total_steps=total_steps)

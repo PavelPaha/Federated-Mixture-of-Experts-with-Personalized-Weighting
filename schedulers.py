@@ -102,37 +102,3 @@ class PeriodicLinearDecayScheduler(AlphaScheduler):
         return current_period_value
 
 
-class SmoothResumeScheduler(AlphaScheduler):
-    """
-    Шедулер для гладкого продолжения с любого значения alpha.
-    Используется при возобновлении с чекпоинта для обеспечения гладкости.
-    """
-    def __init__(self, total_steps, current_step, resume_alpha_value, final_value, 
-                 use_warmup=False, warmup_steps=0):
-        # Инициализируем базовый класс
-        super().__init__(total_steps, use_warmup, warmup_steps, resume_alpha_value, final_value)
-        
-        self.resume_alpha_value = resume_alpha_value
-        self.current_step = current_step
-        self.step_num = current_step
-        
-        # Вычисляем оставшиеся шаги
-        self.remaining_steps = max(1, total_steps - current_step)
-        
-        print(f"🔄 SmoothResumeScheduler: resume_alpha={resume_alpha_value:.6f}, "
-              f"final={final_value:.6f}, remaining_steps={self.remaining_steps}")
-
-    def get_value(self):
-        # Если еще не начали обучение с чекпоинта
-        if self.step_num <= self.current_step:
-            return self.resume_alpha_value
-        
-        # Если достигли конца обучения    
-        if self.step_num >= self.total_steps:
-            return self.final_value
-            
-        # Линейная интерполяция от текущего значения к финальному
-        steps_since_resume = self.step_num - self.current_step
-        progress = steps_since_resume / self.remaining_steps
-        
-        return self.resume_alpha_value + (self.final_value - self.resume_alpha_value) * progress
