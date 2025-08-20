@@ -65,9 +65,32 @@ Checkpoints contain:
 - Full configuration used for training
 - Model configuration for reconstruction
 
+## Scheduler Behavior Fix
+
+⚠️ **Important**: The system automatically handles scheduler continuity when resuming training.
+
+### Problem Solved
+Previously, decay schedulers (Linear, Cosine, Exponential) would not continue properly when resuming from checkpoints because they were recreated with the original `total_steps` instead of the new total.
+
+### Solution Implemented
+- Scheduler is automatically recreated with correct `total_steps = current_step + additional_steps`
+- Scheduler state (`step_num`) is properly restored
+- Decay continues smoothly from checkpoint point
+
+### Example
+```
+Original plan: 1000 steps, LinearScheduler(1.0 → 0.1)
+Checkpoint at: step 300, alpha = 0.73
+Resume with:   400 additional steps
+
+✅ FIXED: Scheduler recreated with total_steps = 700
+✅ Alpha continues: 0.73 → 0.1 over remaining 400 steps
+```
+
 ## Tips
 
 - Always verify the checkpoint path exists before starting training
 - Use lower learning rates when resuming training
 - Consider saving checkpoints more frequently when resuming
-- Keep track of original experiment configs when resuming 
+- Keep track of original experiment configs when resuming
+- **Scheduler decay will continue properly** - no manual adjustments needed 

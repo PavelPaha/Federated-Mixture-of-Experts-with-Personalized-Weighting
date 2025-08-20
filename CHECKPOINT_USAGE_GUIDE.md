@@ -236,4 +236,42 @@ python train.py --config-name test_checkpoint \
   hydra.verbose=true
 ```
 
-This checkpointing system provides robust training continuation capabilities while maintaining the flexibility of the Hydra configuration system. Happy training! 🚀 
+## 🔧 Scheduler Continuity Fix
+
+### ⚠️ Important Update
+**Fixed critical issue**: Decay schedulers (Linear, Cosine, Exponential) now continue properly when resuming from checkpoints.
+
+### Problem & Solution
+**Problem**: Previously, when resuming training with `additional_steps`, the scheduler was recreated with the original `total_steps`, causing incorrect decay behavior.
+
+**Solution**: The system now automatically:
+1. Recreates the scheduler with correct `total_steps = current_step + additional_steps`
+2. Restores the scheduler state (`step_num`) from checkpoint
+3. Ensures smooth decay continuation
+
+### Example
+```
+✅ Scenario: LinearScheduler(initial=1.0, final=0.1)
+   - Original training: 1000 steps
+   - Checkpoint at step 300: alpha = 0.73
+   - Resume with 400 additional steps
+   
+✅ Result: 
+   - Scheduler recreated with total_steps = 700
+   - Alpha smoothly continues: 0.73 → 0.1 over remaining 400 steps
+   - Final alpha reaches expected 0.1 (not 0.37 as before)
+```
+
+### Test Configs
+Use these configs to verify the fix:
+```bash
+# 1. Train with LinearScheduler until checkpoint
+python train.py --config-name test_scheduler_fix
+
+# 2. Resume and verify smooth continuation  
+python train.py --config-name test_scheduler_resume
+```
+
+---
+
+This checkpointing system provides robust training continuation capabilities while maintaining the flexibility of the Hydra configuration system. **Scheduler decay behavior is now fully correct!** Happy training! 🚀 

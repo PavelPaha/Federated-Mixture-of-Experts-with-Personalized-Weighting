@@ -1,0 +1,28 @@
+# @package _global_
+
+defaults:
+  - base
+  - _self_
+
+experiment:
+  name: test_scheduler_fix
+
+training:
+  total_steps: 60  # Короткое обучение для теста
+  checkpoint_interval: 20  # Чекпоинт на шаге 20
+  log_interval: 10
+  eval_interval: 30
+  checkpoint_dir: "./test_scheduler_checkpoints"
+  batch_size: 4
+  
+model:
+  d_model: 64  # Маленькая модель для быстрого теста
+  num_layers: 2
+  num_experts: 2
+
+alpha_schedule:
+  _target_: schedulers.LinearScheduler
+  use_warmup: false
+  warmup_steps: 0
+  initial_value: 1.0
+  final_value: 0.1 

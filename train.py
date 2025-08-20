@@ -30,6 +30,13 @@ def save_checkpoint(model, optimizer, alpha_sched, global_step, cfg, checkpoint_
         'model_state_dict': model.state_dict(),
         'optimizer_state_dict': optimizer.state_dict(),
         'scheduler_step': alpha_sched.step_num,
+        'scheduler_config': {
+            'total_steps': alpha_sched.total_steps,
+            'use_warmup': getattr(alpha_sched, 'use_warmup', False),
+            'warmup_steps': getattr(alpha_sched, 'warmup_steps', 0),
+            'initial_value': getattr(alpha_sched, 'initial_value', None),
+            'final_value': getattr(alpha_sched, 'final_value', None),
+        },
         'global_step': global_step,
         'config': OmegaConf.to_container(cfg, resolve=True),
         'model_config': {
@@ -176,8 +183,6 @@ def main(cfg: DictConfig):
             streaming=False,  # Используем параметр из конфигурации
         )
 
-        alpha_sched = instantiate(cfg.alpha_schedule, total_steps=cfg.training.total_steps)
-
         vocab_size = len(tokenizer)
         # Используем указанный в конфигурации GPU ID
         if torch.cuda.is_available():
@@ -206,13 +211,24 @@ def main(cfg: DictConfig):
         if hasattr(cfg.training, 'resume_from_checkpoint') and cfg.training.resume_from_checkpoint:
             checkpoint_path = cfg.training.checkpoint_path
             print(f"Loading checkpoint from: {checkpoint_path}")
-            global_step, loaded_config = load_checkpoint(checkpoint_path, model, optimizer, alpha_sched, device)
+            
+            # Create temporary scheduler to load checkpoint
+            temp_alpha_sched = instantiate(cfg.alpha_schedule, total_steps=cfg.training.total_steps)
+            global_step, loaded_config = load_checkpoint(checkpoint_path, model, optimizer, temp_alpha_sched, device)
             print(f"Resumed training from step {global_step}")
             
             # If additional_steps is specified, update total_steps
             if hasattr(cfg.training, 'additional_steps') and cfg.training.additional_steps:
                 total_steps = global_step + cfg.training.additional_steps
                 print(f"Training for {cfg.training.additional_steps} additional steps (total: {total_steps})")
+            
+            # IMPORTANT: Recreate scheduler with correct total_steps for proper decay continuation
+            print(f"Recreating scheduler with total_steps={total_steps} for proper continuation")
+            alpha_sched = instantiate(cfg.alpha_schedule, total_steps=total_steps)
+            alpha_sched.step_num = temp_alpha_sched.step_num  # Restore scheduler state
+        else:
+            # Normal training - create scheduler with original total_steps
+            alpha_sched = instantiate(cfg.alpha_schedule, total_steps=total_steps)
 
         # Setup checkpointing
         checkpoint_interval = getattr(cfg.training, 'checkpoint_interval', 5000)
