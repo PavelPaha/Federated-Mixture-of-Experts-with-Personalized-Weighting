@@ -11,41 +11,38 @@ class GShardGate(BaseGate):
         self.top_k = top_k
         self.w_gating = nn.Linear(d_model, self.tot_expert)
 
-    def forward(self, x):
-        """
-        x: [N, d_model]
-        returns:
-          top_scores: [N, top_k]   (normalized weights)
-          top_indices: [N, top_k]  (chosen expert indices in [0, tot_expert-1])
-        """
-        N = x.size(0)
-        logits = self.w_gating(x)                  # [N, tot_expert]
-        scores = F.softmax(logits, dim=-1)         # [N, tot_expert]
+    def forward(self, x, capacity=None):
+      """
+      x: [N, d_model]
+      returns:
+        top_scores: [N, top_k]
+        top_indices: [N, top_k]
+      """
+      N = x.size(0)
+      logits = self.w_gating(x)                  # [N, tot_expert]
+      scores = F.softmax(logits, dim=-1)         # [N, tot_expert]
 
-        # top-k экспертов
-        top_scores, top_indices = torch.topk(scores, self.top_k, dim=-1)  # both [N, top_k]
+      # top-k экспертов
+      top_scores, top_indices = torch.topk(scores, self.top_k, dim=-1)  # [N, top_k]
+      top_scores = top_scores / (top_scores.sum(dim=-1, keepdim=True) + 1e-12)
 
-        # нормировка внутри top-k (по строке)
-        top_scores = top_scores / (top_scores.sum(dim=-1, keepdim=True) + 1e-12)
+      # ---------------- AUX LOSS ----------------
+      # mean gates per expert (m_e)
+      mean_gates = scores.mean(dim=0)  # [E]
 
-        # ---------- balance loss ----------
-        # prob_per_expert: avg softmax prob per expert
-        prob_per_expert = scores.mean(dim=0)  # [tot_expert]
+      # фактические назначения (c_e)
+      # берём только top-1 (в картинке баланс считается на основе e1)
+      one_hot_e1 = F.one_hot(top_indices[:, 0], num_classes=self.tot_expert).float()  # [N, E]
+      counts = one_hot_e1.sum(dim=0)  # [E]
 
-        # actual counts: сколько раз каждый эксперт был выбран (суммируем по N и top_k)
-        one_hot = F.one_hot(top_indices, num_classes=self.tot_expert).float()  # [N, top_k, tot_expert]
-        counts = one_hot.sum(dim=(0, 1)).float()  # [tot_expert]  (sum over N and top_k)
+      # нормализуем по размеру группы
+      frac_assigned = counts / float(N)  # c_e / S
 
-        # load: доля назначений на эксперта
-        load = counts / (N * float(self.top_k) + 1e-12)  # [tot_expert], в диапазоне [0,1]
+      # формула из статьи
+      balance_loss = (frac_assigned * mean_gates).mean() * self.tot_expert
 
-        # L_balance (GShard-like): tot_expert * sum(prob * load)
-        balance_loss = self.tot_expert * torch.dot(prob_per_expert, load)
+      # сохранить
+      self.set_loss(balance_loss)
+      self.save_gate_output(mean_gates)
 
-        # сохраняем лосс в гейте
-        self.set_loss(balance_loss)
-        
-        # сохраняем выход гейта для логирования
-        self.save_gate_output(scores)
-
-        return top_scores, top_indices
+      return top_scores, top_indices

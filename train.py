@@ -157,12 +157,6 @@ def main(cfg: DictConfig):
 
         pbar = tqdm(total=total_steps, desc="Training", unit="step")
 
-        # Переменные для накопления loss за log_interval шагов
-        accumulated_loss = 0.0
-        accumulated_ce_loss = 0.0
-        accumulated_balance_loss = 0.0
-        accumulated_steps = 0
-        
         # Списки для хранения всех метрик за log_interval шагов
         batch_losses = []
         batch_ce_losses = []
@@ -194,12 +188,6 @@ def main(cfg: DictConfig):
                 # Вычисляем mean_balance_loss на каждом шаге для tqdm
                 mean_balance_loss = balance_loss / cfg.model.num_layers
 
-                # Накопление loss для среднего (оставляем для tqdm)
-                accumulated_loss += loss.item()
-                accumulated_ce_loss += ce_loss.item()
-                accumulated_balance_loss += mean_balance_loss.item()
-                accumulated_steps += 1
-                
                 # Добавляем батч метрики в списки
                 batch_losses.append(loss.item())
                 batch_ce_losses.append(ce_loss.item())
@@ -210,31 +198,13 @@ def main(cfg: DictConfig):
 
                 # Логгирование каждые log_interval шагов
                 if global_step % cfg.training.log_interval == 0:
-                    # Вычисляем средние значения за log_interval шагов (для tqdm)
-                    avg_loss = accumulated_loss / accumulated_steps
-                    avg_ce_loss = accumulated_ce_loss / accumulated_steps
-                    avg_balance_loss = accumulated_balance_loss / accumulated_steps
-                    avg_ppl = torch.exp(torch.tensor(avg_ce_loss)).item()
-                    
                     # Логируем все батч метрики за период log_interval
                     for i, (step, loss_val, ce_loss_val, balance_loss_val) in enumerate(zip(batch_steps, batch_losses, batch_ce_losses, batch_balance_losses)):
                         mlflow.log_metric("train_loss", loss_val, step=step)
                         mlflow.log_metric("train_ce_loss", ce_loss_val, step=step)
                         mlflow.log_metric("train_mean_balance_loss", balance_loss_val, step=step)
                         mlflow.log_metric("train_perplexity", torch.exp(torch.tensor(ce_loss_val)).item(), step=step)
-                    
-                    # Логируем средние значения для сравнения
-                    mlflow.log_metric("train_loss_avg", avg_loss, step=global_step)
-                    mlflow.log_metric("train_ce_loss_avg", avg_ce_loss, step=global_step)
-                    mlflow.log_metric("train_mean_balance_loss_avg", avg_balance_loss, step=global_step)
-                    mlflow.log_metric("train_perplexity_avg", avg_ppl, step=global_step)
                     mlflow.log_metric("alpha_sched", alpha_sched.get_value(), step=global_step)
-                    
-                    # Сбрасываем накопленные значения
-                    accumulated_loss = 0.0
-                    accumulated_ce_loss = 0.0
-                    accumulated_balance_loss = 0.0
-                    accumulated_steps = 0
                     
                     # Очищаем списки батч метрик
                     batch_losses.clear()
