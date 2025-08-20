@@ -14,7 +14,8 @@ alpha_schedule:
   use_warmup: true
   warmup_steps: 1000
   initial_value: 1.0
-  final_value: 0.0
+  final_value: 0.01
+
 
 
 

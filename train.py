@@ -36,7 +36,7 @@ def evaluate_model(model, dataloader, criterion, device):
     total_balance_loss = 0.0
     num_batches = 0
 
-    max_steps = 1000
+    max_steps = 400
     
     with torch.no_grad():
         for i, batch in enumerate(tqdm(dataloader, desc="Evaluating")):
@@ -53,8 +53,16 @@ def evaluate_model(model, dataloader, criterion, device):
             total_loss += ce_loss.item()
             total_balance_loss += balance_loss.item()
             num_batches += 1
+            
+            # Очищаем память от промежуточных тензоров
+            del inp, tgt, logits, ce_loss, balance_loss
     
     model.train()
+    
+    # Принудительная очистка памяти GPU
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+    
     return total_loss / num_batches, total_balance_loss / num_batches
 
 
@@ -154,86 +162,121 @@ def main(cfg: DictConfig):
         accumulated_ce_loss = 0.0
         accumulated_balance_loss = 0.0
         accumulated_steps = 0
+        
+        # Списки для хранения всех метрик за log_interval шагов
+        batch_losses = []
+        batch_ce_losses = []
+        batch_balance_losses = []
+        batch_steps = []
 
         model.train()
-        for batch in train_dataloader:
-            if global_step >= total_steps:
-                # print("global_step >= total_steps")
-                break
+        while global_step < total_steps:
+            for batch in train_dataloader:
+                if global_step >= total_steps:
+                    # print("global_step >= total_steps")
+                    break
+                    
+                # print(f"Processing step {global_step}")
+                inp, tgt = batch
+                inp, tgt = inp.to(device), tgt.to(device)
+
+                optimizer.zero_grad()
+                logits = model(inp)
+                ce_loss = criterion(logits.view(-1, logits.size(-1)), tgt.view(-1))
+                # print('aboba')
                 
-            # print(f"Processing step {global_step}")
-            inp, tgt = batch
-            inp, tgt = inp.to(device), tgt.to(device)
+                balance_loss = calc_balance_loss(model, device)    
+                loss = ce_loss + alpha_sched.get_value() * balance_loss
 
-            optimizer.zero_grad()
-            logits = model(inp)
-            ce_loss = criterion(logits.view(-1, logits.size(-1)), tgt.view(-1))
-            # print('aboba')
-            
-            balance_loss = calc_balance_loss(model, device)    
-            loss = ce_loss + alpha_sched.get_value() * balance_loss
+                loss.backward()
+                optimizer.step()
 
-            loss.backward()
-            optimizer.step()
+                # Вычисляем mean_balance_loss на каждом шаге для tqdm
+                mean_balance_loss = balance_loss / cfg.model.num_layers
 
-            # Вычисляем mean_balance_loss на каждом шаге для tqdm
-            mean_balance_loss = balance_loss / cfg.model.num_layers
-
-            # Накопление loss для среднего
-            accumulated_loss += loss.item()
-            accumulated_ce_loss += ce_loss.item()
-            accumulated_balance_loss += mean_balance_loss.item()
-            accumulated_steps += 1
-
-            # print('asdfasdf')
-
-            # Логгирование каждые 100 шагов
-            if global_step % cfg.training.log_interval == 0:
-                # Вычисляем средние значения за log_interval шагов
-                avg_loss = accumulated_loss / accumulated_steps
-                avg_ce_loss = accumulated_ce_loss / accumulated_steps
-                avg_balance_loss = accumulated_balance_loss / accumulated_steps
-                avg_ppl = torch.exp(torch.tensor(avg_ce_loss)).item()
+                # Накопление loss для среднего (оставляем для tqdm)
+                accumulated_loss += loss.item()
+                accumulated_ce_loss += ce_loss.item()
+                accumulated_balance_loss += mean_balance_loss.item()
+                accumulated_steps += 1
                 
-                # Логируем средние значения
-                mlflow.log_metric("train_loss_avg", avg_loss, step=global_step)
-                mlflow.log_metric("train_ce_loss_avg", avg_ce_loss, step=global_step)
-                mlflow.log_metric("train_mean_balance_loss_avg", avg_balance_loss, step=global_step)
-                mlflow.log_metric("train_perplexity_avg", avg_ppl, step=global_step)
-                mlflow.log_metric("alpha_sched", alpha_sched.get_value(), step=global_step)
-                
-                # Сбрасываем накопленные значения
-                accumulated_loss = 0.0
-                accumulated_ce_loss = 0.0
-                accumulated_balance_loss = 0.0
-                accumulated_steps = 0
-                
-            # Обновляем tqdm на каждом шаге
-            pbar.set_postfix(
-                loss=f"{loss.item():.4f}", 
-                ce=f"{ce_loss.item():.4f}", 
-                mean_balance=f"{mean_balance_loss.item():.4f}"
-            )
+                # Добавляем батч метрики в списки
+                batch_losses.append(loss.item())
+                batch_ce_losses.append(ce_loss.item())
+                batch_balance_losses.append(mean_balance_loss.item())
+                batch_steps.append(global_step)
 
-            # print('12323')
-            # Валидация каждые 1000 шагов
-            if global_step % cfg.training.eval_interval == 0:
-                val_ce_loss, val_balance_loss = evaluate_model(model, val_dataloader, criterion, device)
-                val_ppl = torch.exp(torch.tensor(val_ce_loss)).item()
-                mean_val_balance_loss = val_balance_loss / cfg.model.num_layers
-                
-                mlflow.log_metric("val_ce_loss", val_ce_loss, step=global_step)
-                mlflow.log_metric("val_mean_balance_loss", mean_val_balance_loss, step=global_step)
-                mlflow.log_metric("val_perplexity", val_ppl, step=global_step)
+                # print('asdfasdf')
 
-            if global_step % 500 == 0:
-                log_gate_distributions(model, global_step, mlflow)
+                # Логгирование каждые log_interval шагов
+                if global_step % cfg.training.log_interval == 0:
+                    # Вычисляем средние значения за log_interval шагов (для tqdm)
+                    avg_loss = accumulated_loss / accumulated_steps
+                    avg_ce_loss = accumulated_ce_loss / accumulated_steps
+                    avg_balance_loss = accumulated_balance_loss / accumulated_steps
+                    avg_ppl = torch.exp(torch.tensor(avg_ce_loss)).item()
+                    
+                    # Логируем все батч метрики за период log_interval
+                    for i, (step, loss_val, ce_loss_val, balance_loss_val) in enumerate(zip(batch_steps, batch_losses, batch_ce_losses, batch_balance_losses)):
+                        mlflow.log_metric("train_loss", loss_val, step=step)
+                        mlflow.log_metric("train_ce_loss", ce_loss_val, step=step)
+                        mlflow.log_metric("train_mean_balance_loss", balance_loss_val, step=step)
+                        mlflow.log_metric("train_perplexity", torch.exp(torch.tensor(ce_loss_val)).item(), step=step)
+                    
+                    # Логируем средние значения для сравнения
+                    mlflow.log_metric("train_loss_avg", avg_loss, step=global_step)
+                    mlflow.log_metric("train_ce_loss_avg", avg_ce_loss, step=global_step)
+                    mlflow.log_metric("train_mean_balance_loss_avg", avg_balance_loss, step=global_step)
+                    mlflow.log_metric("train_perplexity_avg", avg_ppl, step=global_step)
+                    mlflow.log_metric("alpha_sched", alpha_sched.get_value(), step=global_step)
+                    
+                    # Сбрасываем накопленные значения
+                    accumulated_loss = 0.0
+                    accumulated_ce_loss = 0.0
+                    accumulated_balance_loss = 0.0
+                    accumulated_steps = 0
+                    
+                    # Очищаем списки батч метрик
+                    batch_losses.clear()
+                    batch_ce_losses.clear()
+                    batch_balance_losses.clear()
+                    batch_steps.clear()
 
-            global_step += 1
-            alpha_sched.step()
-            pbar.update(1)
+                # Обновляем tqdm на каждом шаге
+                pbar.set_postfix(
+                    loss=f"{loss.item():.4f}", 
+                    ce=f"{ce_loss.item():.4f}", 
+                    mean_balance=f"{mean_balance_loss.item():.4f}"
+                )
 
-        # mlflow.pytorch.log_model(model, artifact_path="model")
+                # print('12323')
+                # Валидация каждые 1000 шагов
+                if global_step % cfg.training.eval_interval == 0:
+                    val_ce_loss, val_balance_loss = evaluate_model(model, val_dataloader, criterion, device)
+                    val_ppl = torch.exp(torch.tensor(val_ce_loss)).item()
+                    mean_val_balance_loss = val_balance_loss / cfg.model.num_layers
+                    
+                    mlflow.log_metric("val_ce_loss", val_ce_loss, step=global_step)
+                    mlflow.log_metric("val_mean_balance_loss", mean_val_balance_loss, step=global_step)
+                    mlflow.log_metric("val_perplexity", val_ppl, step=global_step)
+                    
+                    # Дополнительная очистка памяти после валидации
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
+                        torch.cuda.synchronize()  # Синхронизируем GPU
+
+                if global_step % 2500 == 0:
+                    log_gate_distributions(model, global_step, mlflow)
+                    
+                    # Очистка памяти после создания графиков
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
+
+                global_step += 1
+                alpha_sched.step()
+                pbar.update(1)
+
+        mlflow.pytorch.log_model(model, artifact_path="model")
 
 
 if __name__ == "__main__":

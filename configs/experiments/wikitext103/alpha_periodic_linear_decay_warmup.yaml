@@ -16,7 +16,6 @@ alpha_schedule:
   initial_value: 1.0
   final_value: 0.01
   period_steps: 2000
-  start_step: 1000
 
 
 

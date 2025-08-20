@@ -34,23 +34,50 @@ class CosineScheduler(AlphaScheduler):
     def get_value(self):
         if self.use_warmup and self.step_num <= self.warmup_steps:
             return self.initial_value * self.step_num / self.warmup_steps
-        progress = (self.step_num - self.warmup_steps) / max(1, self.total_steps - self.warmup_steps)
-        return self.final_value + 0.5 * (self.initial_value - self.final_value) * (1 + torch.cos(torch.tensor(progress * 3.14159265)))
+        
+        # Вычисляем прогресс после warmup (от 0 до 1)
+        steps_after_warmup = self.step_num - self.warmup_steps
+        total_steps_after_warmup = self.total_steps - self.warmup_steps
+        progress = steps_after_warmup / max(1, total_steps_after_warmup)
+        
+        # Косинусный decay: плавное изменение по косинусу
+        # progress = 0 -> alpha = initial_value, progress = 1 -> alpha = final_value
+        return self.final_value + (self.initial_value - self.final_value) * (1 + torch.cos(torch.tensor(progress * 3.14159265))) / 2
 
 
 class ExponentialScheduler(AlphaScheduler):
     def get_value(self):
         if self.use_warmup and self.step_num <= self.warmup_steps:
             return self.initial_value * self.step_num / self.warmup_steps
-        progress = (self.step_num - self.warmup_steps) / max(1, self.total_steps - self.warmup_steps)
-        return self.initial_value * (self.final_value / self.initial_value) ** progress
+        
+        # Вычисляем прогресс после warmup (от 0 до 1)
+        steps_after_warmup = self.step_num - self.warmup_steps
+        total_steps_after_warmup = self.total_steps - self.warmup_steps
+        progress = steps_after_warmup / max(1, total_steps_after_warmup)
+        
+        # Экспоненциальный decay с защитой от final_value = 0
+        if self.final_value == 0:
+            # Если final_value = 0, используем формулу: initial * exp(-k * progress)
+            # где k подбирается так, чтобы alpha был близок к 0 в конце
+            k = 5.0  # коэффициент затухания (можно настроить)
+            return self.initial_value * torch.exp(torch.tensor(-k * progress))
+        else:
+            # Если final_value != 0, используем стандартную формулу
+            return self.initial_value * (self.final_value / self.initial_value) ** progress
 
 
 class LinearScheduler(AlphaScheduler):
     def get_value(self):
         if self.use_warmup and self.step_num <= self.warmup_steps:
             return self.initial_value * self.step_num / self.warmup_steps
-        progress = (self.step_num - self.warmup_steps) / max(1, self.total_steps - self.warmup_steps)
+        
+        # Вычисляем прогресс после warmup (от 0 до 1)
+        steps_after_warmup = self.step_num - self.warmup_steps
+        total_steps_after_warmup = self.total_steps - self.warmup_steps
+        progress = steps_after_warmup / max(1, total_steps_after_warmup)
+        
+        # Линейный decay: плавное линейное изменение
+        # progress = 0 -> alpha = initial_value, progress = 1 -> alpha = final_value
         return self.initial_value + (self.final_value - self.initial_value) * progress
 
 
