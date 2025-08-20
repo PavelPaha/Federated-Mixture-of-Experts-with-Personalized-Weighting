@@ -1,0 +1,21 @@
+# @package _global_
+
+defaults:
+  - base
+  - _self_
+
+experiment:
+  name: test_checkpointing
+
+training:
+  total_steps: 100  # Very short training for testing
+  checkpoint_interval: 25  # Checkpoint every 25 steps
+  log_interval: 10  # Log every 10 steps
+  eval_interval: 50  # Evaluate every 50 steps
+  checkpoint_dir: "./test_checkpoints"
+  batch_size: 8  # Smaller batch for faster testing
+  
+model:
+  d_model: 128  # Smaller model for testing
+  num_layers: 2
+  num_experts: 4 

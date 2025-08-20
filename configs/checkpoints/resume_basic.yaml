@@ -1,0 +1,14 @@
+# @package _global_
+
+defaults:
+  - /base
+  - _self_
+
+experiment:
+  name: moe_resume_basic
+
+training:
+  resume_from_checkpoint: true
+  checkpoint_path: "./checkpoints/latest.pt"  # Path to checkpoint
+  additional_steps: 10000  # Train for 10k more steps
+  checkpoint_interval: 2500  # More frequent checkpoints when resuming 

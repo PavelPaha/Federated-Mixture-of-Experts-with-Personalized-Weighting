@@ -1,0 +1,17 @@
+# @package _global_
+
+defaults:
+  - /base
+  - _self_
+
+experiment:
+  name: moe_resume_from_step
+
+training:
+  resume_from_checkpoint: true
+  checkpoint_path: "./checkpoints/checkpoint_step_15000.pt"  # Specific checkpoint
+  additional_steps: 15000  # Train for 15k more steps
+  checkpoint_interval: 5000  # Standard checkpoint interval
+  
+  # Override some training settings for fine-tuning
+  lr: 1e-4  # Lower learning rate for continued training 

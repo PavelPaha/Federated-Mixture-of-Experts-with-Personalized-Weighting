@@ -1,0 +1,15 @@
+# @package _global_
+
+defaults:
+  - /experiments/wikitext103/alpha_0_2  # Inherit from specific experiment
+  - _self_
+
+experiment:
+  name: moe_resume_wikitext103_alpha_0_2
+
+training:
+  resume_from_checkpoint: true
+  checkpoint_path: "./checkpoints/experiment_alpha_0_2/checkpoint_step_20000.pt"
+  additional_steps: 10000
+  checkpoint_interval: 2500
+  checkpoint_dir: "./checkpoints/resumed_experiment"  # New checkpoint directory 

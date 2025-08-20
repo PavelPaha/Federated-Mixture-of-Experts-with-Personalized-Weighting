@@ -19,6 +19,13 @@ training:
   total_steps: 30000
   gpu_id: 3 # default id
   streaming: true  # Использовать потоковый режим для экономии памяти
+  
+  # Checkpoint settings
+  checkpoint_interval: 5000  # Save checkpoint every N steps
+  checkpoint_dir: "./checkpoints"  # Directory to save checkpoints
+  resume_from_checkpoint: false  # Whether to resume from checkpoint
+  checkpoint_path: null  # Path to checkpoint file (when resuming)
+  additional_steps: null  # Additional steps to train when resuming
 
 validation:
   batch_size: 32

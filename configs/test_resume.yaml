@@ -1,0 +1,23 @@
+# @package _global_
+
+defaults:
+  - base
+  - _self_
+
+experiment:
+  name: test_resume_checkpointing
+
+training:
+  resume_from_checkpoint: true
+  checkpoint_path: "./test_checkpoints/latest.pt"
+  additional_steps: 50  # Train 50 more steps after resuming
+  checkpoint_interval: 20  # Checkpoint every 20 steps
+  log_interval: 10
+  eval_interval: 30
+  checkpoint_dir: "./test_checkpoints_resumed"
+  batch_size: 8
+  
+model:
+  d_model: 128  # Must match original checkpoint
+  num_layers: 2
+  num_experts: 4 

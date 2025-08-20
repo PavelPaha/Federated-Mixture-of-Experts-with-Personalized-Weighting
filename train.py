@@ -8,12 +8,59 @@ import torch.optim as optim
 from tqdm import tqdm
 import matplotlib.pyplot as plt
 import io
+import os
+import json
+from pathlib import Path
 
 from datasets import load_dataset
 from data import create_wikitext_dataloader, tokenizer
 from model import TransformerWithMoE
 from gates import BaseGate
 from hydra.utils import instantiate
+
+
+def save_checkpoint(model, optimizer, alpha_sched, global_step, cfg, checkpoint_dir, step=None):
+    """Save training checkpoint with model weights, optimizer state, and training metadata"""
+    os.makedirs(checkpoint_dir, exist_ok=True)
+    
+    step_suffix = f"_step_{step}" if step is not None else ""
+    checkpoint_path = os.path.join(checkpoint_dir, f"checkpoint{step_suffix}.pt")
+    
+    checkpoint = {
+        'model_state_dict': model.state_dict(),
+        'optimizer_state_dict': optimizer.state_dict(),
+        'scheduler_step': alpha_sched.step_num,
+        'global_step': global_step,
+        'config': OmegaConf.to_container(cfg, resolve=True),
+        'model_config': {
+            'vocab_size': len(tokenizer),
+            'd_model': cfg.model.d_model,
+            'num_layers': cfg.model.num_layers,
+            'num_experts': cfg.model.num_experts,
+            'top_k': cfg.model.top_k,
+            'padding_idx': cfg.model.padding_idx,
+        }
+    }
+    
+    torch.save(checkpoint, checkpoint_path)
+    
+    # Save a "latest" symlink/copy for easy access
+    latest_path = os.path.join(checkpoint_dir, "latest.pt")
+    torch.save(checkpoint, latest_path)
+    
+    return checkpoint_path
+
+
+def load_checkpoint(checkpoint_path, model, optimizer, alpha_sched, device):
+    """Load training checkpoint and restore model weights, optimizer state, and training metadata"""
+    checkpoint = torch.load(checkpoint_path, map_location=device)
+    
+    model.load_state_dict(checkpoint['model_state_dict'])
+    optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+    alpha_sched.step_num = checkpoint['scheduler_step']
+    global_step = checkpoint['global_step']
+    
+    return global_step, checkpoint.get('config', {})
 
 
 def calc_balance_loss(model, device):
@@ -154,8 +201,24 @@ def main(cfg: DictConfig):
 
         global_step = 0
         total_steps = cfg.training.total_steps
+        
+        # Handle checkpoint loading if resuming from checkpoint
+        if hasattr(cfg.training, 'resume_from_checkpoint') and cfg.training.resume_from_checkpoint:
+            checkpoint_path = cfg.training.checkpoint_path
+            print(f"Loading checkpoint from: {checkpoint_path}")
+            global_step, loaded_config = load_checkpoint(checkpoint_path, model, optimizer, alpha_sched, device)
+            print(f"Resumed training from step {global_step}")
+            
+            # If additional_steps is specified, update total_steps
+            if hasattr(cfg.training, 'additional_steps') and cfg.training.additional_steps:
+                total_steps = global_step + cfg.training.additional_steps
+                print(f"Training for {cfg.training.additional_steps} additional steps (total: {total_steps})")
 
-        pbar = tqdm(total=total_steps, desc="Training", unit="step")
+        # Setup checkpointing
+        checkpoint_interval = getattr(cfg.training, 'checkpoint_interval', 5000)
+        checkpoint_dir = getattr(cfg.training, 'checkpoint_dir', './checkpoints')
+
+        pbar = tqdm(total=total_steps, desc="Training", unit="step", initial=global_step)
 
         # Списки для хранения всех метрик за log_interval шагов
         batch_losses = []
@@ -212,6 +275,12 @@ def main(cfg: DictConfig):
                     batch_balance_losses.clear()
                     batch_steps.clear()
 
+                # Checkpointing
+                if global_step % checkpoint_interval == 0 and global_step > 0:
+                    checkpoint_path = save_checkpoint(model, optimizer, alpha_sched, global_step, cfg, checkpoint_dir, global_step)
+                    print(f"Saved checkpoint at step {global_step}: {checkpoint_path}")
+                    mlflow.log_artifact(checkpoint_path, "checkpoints")
+
                 # Обновляем tqdm на каждом шаге
                 pbar.set_postfix(
                     loss=f"{loss.item():.4f}", 
@@ -245,6 +314,11 @@ def main(cfg: DictConfig):
                 global_step += 1
                 alpha_sched.step()
                 pbar.update(1)
+
+        # Save final checkpoint
+        final_checkpoint_path = save_checkpoint(model, optimizer, alpha_sched, global_step, cfg, checkpoint_dir, "final")
+        print(f"Saved final checkpoint: {final_checkpoint_path}")
+        mlflow.log_artifact(final_checkpoint_path, "checkpoints")
 
         mlflow.pytorch.log_model(model, artifact_path="model")
 
